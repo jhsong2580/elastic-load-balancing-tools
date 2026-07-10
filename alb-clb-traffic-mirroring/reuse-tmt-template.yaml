@@ -1,0 +1,991 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Automatic Traffic Mirroring for ALB (Reusable AZ-based EC2)
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: "Load Balancer"
+        Parameters:
+          - ELBName
+          - ELBType
+      - Label:
+          default: "Traffic Mirror Target EC2 — One EC2 instance is created per selected subnet to receive mirrored traffic."
+        Parameters:
+          - TrafficMirroringTargetSubnets
+          - TrafficMirroringTargetInstanceType
+          - KeyPairName
+      - Label:
+          default: "Pcap Capture Settings — Files are rotated and uploaded to S3 when EITHER the time limit (-G) OR size limit (-C) is reached, whichever comes first. Use -s to limit capture to packet headers only and reduce file size."
+        Parameters:
+          - PcapRotateSeconds
+          - PcapMaxSizeMB
+          - PcapSnapLen
+      - Label:
+          default: "Storage"
+        Parameters:
+          - ExistingBucketArn
+    ParameterLabels:
+      ELBName:
+        default: "ALB/CLB Name"
+      ELBType:
+        default: "Load Balancer Type"
+      TrafficMirroringTargetSubnets:
+        default: "Target Subnets (same VPC as ALB/CLB)"
+      TrafficMirroringTargetInstanceType:
+        default: "EC2 Instance Type"
+      KeyPairName:
+        default: "SSH Key Pair (optional)"
+      PcapRotateSeconds:
+        default: "Rotation Interval (-G seconds)"
+      PcapMaxSizeMB:
+        default: "Max File Size (-C MB)"
+      PcapSnapLen:
+        default: "Snapshot Length (-s bytes, 0=full)"
+      ExistingBucketArn:
+        default: "Existing S3 Bucket ARN (optional)"
+
+Parameters:
+  ELBName:
+    Type: String
+    Description: "Name of ALB or CLB to mirror"
+  ELBType:
+    Type: String
+    AllowedValues:
+      - ALB
+      - CLB
+    Description: "Type of Elastic Load Balancer"
+  TrafficMirroringTargetSubnets:
+    Type: List<AWS::EC2::Subnet::Id>
+    Description: "Traffic Mirroring Target Subnets (one per ALB AZ)"
+  TrafficMirroringTargetInstanceType:
+    Type: String
+    Default: c5.xlarge
+    AllowedValues:
+      - t3.micro
+      - t3.small
+      - t3.medium
+      - t3.large
+      - c5.large
+      - c5.xlarge
+      - c5.2xlarge
+      - c5n.large
+      - c5n.xlarge
+      - c5n.2xlarge
+  ExistingBucketArn:
+    Type: String
+    Default: ""
+    Description: "Existing S3 bucket ARN (e.g. arn:aws:s3:::my-bucket). Leave empty to create new."
+    AllowedPattern: "^(arn:aws:s3:::[a-z0-9.-]+|)$"
+    ConstraintDescription: "Must be a valid S3 bucket ARN or empty"
+  KeyPairName:
+    Type: String
+    Default: ""
+    Description: "EC2 Key Pair name for SSH access to TMT instances. Leave empty for no SSH access."
+  PcapRotateSeconds:
+    Type: Number
+    Default: 1800
+    Description: "Pcap file rotation interval in seconds (-G option). Default 1800 (30 min)."
+  PcapMaxSizeMB:
+    Type: Number
+    Default: 500
+    Description: "Pcap file max size in MB before rotation (-C option). Default 500 MB."
+  PcapSnapLen:
+    Type: Number
+    Default: 0
+    Description: "Pcap snapshot length in bytes (-s option). 0 = capture full packet."
+
+Conditions:
+  CreateBucket: !Equals [!Ref ExistingBucketArn, ""]
+
+Resources:
+  # ============================================================
+  # ParseELB Custom Resource
+  # ============================================================
+  ParseELBRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub
+        - "tms-create-stack-${StackUUID}-parse-role"
+        - StackUUID: !Select [0, !Split ["-", !Select [2, !Split ["/", !Ref "AWS::StackId"]]]]
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: ParseELBPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - elasticloadbalancing:DescribeLoadBalancers
+                  - ec2:DescribeSubnets
+                  - ec2:DescribeVpcs
+                  - ec2:DescribePrefixLists
+                Resource: "*"
+
+  ParseELBFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub
+        - "tms-create-stack-${StackUUID}-parse-elb"
+        - StackUUID: !Select [0, !Split ["-", !Select [2, !Split ["/", !Ref "AWS::StackId"]]]]
+      Runtime: python3.12
+      Handler: index.handler
+      Role: !GetAtt ParseELBRole.Arn
+      Timeout: 30
+      Code:
+        ZipFile: |
+          import boto3, json, logging
+          from dataclasses import dataclass
+          from urllib.request import urlopen, Request
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+          ec2 = boto3.client('ec2')
+          elbv2 = boto3.client('elbv2')
+          elb = boto3.client('elb')
+
+          @dataclass
+          class LoadBalancer:
+              name: str
+              vpc_id: str
+              availability_zones: list
+              eni_description: str
+              lb_type: str
+
+          @dataclass
+          class Subnet:
+              subnet_id: str
+              vpc_id: str
+              availability_zone: str
+              @staticmethod
+              def from_aws_response(describeApiResult):
+                  return Subnet(subnet_id=describeApiResult['SubnetId'], vpc_id=describeApiResult['VpcId'], availability_zone=describeApiResult['AvailabilityZone'])
+
+          @dataclass
+          class StackEvent:
+              elb_name: str
+              elb_type: str
+              tmt_subnets: list
+              stack_name: str
+              lb: object
+
+          def parseLb(elb_name, elb_type):
+              if elb_type == 'ALB':
+                  resp = elbv2.describe_load_balancers(Names=[elb_name])
+                  raw = resp['LoadBalancers'][0]
+                  alb_path = raw['LoadBalancerArn'].split(':loadbalancer/')[1]
+                  return LoadBalancer(name=elb_name, vpc_id=raw['VpcId'], availability_zones=[az['ZoneName'] for az in raw['AvailabilityZones']], eni_description=f"ELB {alb_path}", lb_type='alb')
+              else:
+                  resp = elb.describe_load_balancers(LoadBalancerNames=[elb_name])
+                  raw = resp['LoadBalancerDescriptions'][0]
+                  return LoadBalancer(name=elb_name, vpc_id=raw['VPCId'], availability_zones=raw['AvailabilityZones'], eni_description=f"ELB {elb_name}", lb_type='clb')
+
+          def parseEvent(event):
+              elb_name = event['ResourceProperties'].get('ELBName', '')
+              elb_type = event['ResourceProperties'].get('ELBType', '')
+              tmt_subnets = event['ResourceProperties'].get('TMTSubnets', [])
+              stack_name = event['StackId'].split('/')[1]
+              if not elb_name: raise ValueError('ELBName must not be empty')
+              if elb_type not in ('ALB', 'CLB'): raise ValueError(f'ELBType must be ALB or CLB, got: {elb_type}')
+              if not tmt_subnets: raise ValueError('TMTSubnets must not be empty')
+              if not stack_name: raise ValueError('StackName must not be empty')
+              lb = parseLb(elb_name, elb_type)
+              return StackEvent(elb_name=elb_name, elb_type=elb_type, tmt_subnets=tmt_subnets, stack_name=stack_name, lb=lb)
+
+          def cfn_send(event, context, status, data={}, reason=''):
+              body = json.dumps({'Status': status, 'Reason': reason or f'See CloudWatch Log Stream: {context.log_stream_name}', 'PhysicalResourceId': context.log_stream_name, 'StackId': event['StackId'], 'RequestId': event['RequestId'], 'LogicalResourceId': event['LogicalResourceId'], 'NoEcho': False, 'Data': data})
+              logger.info(f'cfn_send: status={status}, data={data}, reason={reason}')
+              req = Request(event['ResponseURL'], data=body.encode(), method='PUT')
+              req.add_header('Content-Type', '')
+              req.add_header('Content-Length', str(len(body)))
+              urlopen(req)
+
+          def handler(event, context):
+              logger.info(f'Event: {json.dumps(event)}')
+              if event['RequestType'] == 'Delete':
+                  cfn_send(event, context, 'SUCCESS')
+                  return
+              try:
+                  tag_prefix = event['StackId'].split('/')[2].split('-')[0]
+                  stackEvent = parseEvent(event)
+                  sanitized_stack_name = stackEvent.stack_name[:15].lower()
+                  logger.info(f'ELB: name={stackEvent.lb.name}, type={stackEvent.lb.lb_type}, vpc={stackEvent.lb.vpc_id}')
+                  tmt_subnets = [Subnet.from_aws_response(s) for s in ec2.describe_subnets(SubnetIds=stackEvent.tmt_subnets)['Subnets']]
+                  lb_azs = set(stackEvent.lb.availability_zones)
+                  tmt_subnet_mapping = {}
+                  for s in tmt_subnets:
+                      if s.vpc_id != stackEvent.lb.vpc_id:
+                          raise ValueError(f"Subnet {s.subnet_id} belongs to VPC {s.vpc_id}, not {stackEvent.lb.vpc_id}")
+                      if s.availability_zone in lb_azs:
+                          tmt_subnet_mapping[s.availability_zone] = s.subnet_id
+                  missing_azs = lb_azs - set(tmt_subnet_mapping.keys())
+                  if missing_azs: logger.warning(f"No TM-T subnet for AZ: {missing_azs}. Cross-AZ mirroring will be used.")
+                  vpc_info = ec2.describe_vpcs(VpcIds=[stackEvent.lb.vpc_id])
+                  vpc_cidr = vpc_info['Vpcs'][0]['CidrBlock']
+                  region = event['StackId'].split(':')[3]
+                  prefix_lists = ec2.describe_prefix_lists(Filters=[{'Name': 'prefix-list-name', 'Values': [f'com.amazonaws.{region}.s3']}])
+                  s3_prefix_list_id = prefix_lists['PrefixLists'][0]['PrefixListId']
+                  cfn_send(event, context, 'SUCCESS', {
+                      'ELBName': stackEvent.lb.name, 'ENIDescription': stackEvent.lb.eni_description,
+                      'LBType': stackEvent.lb.lb_type, 'SubnetMapping': json.dumps(tmt_subnet_mapping),
+                      'VpcCidr': vpc_cidr, 'VpcId': stackEvent.lb.vpc_id,
+                      'TagPrefix': tag_prefix, 'SanitizedStackName': sanitized_stack_name,
+                      'S3PrefixListId': s3_prefix_list_id
+                  })
+              except Exception as e:
+                  logger.error(f'Error: {str(e)}')
+                  cfn_send(event, context, 'FAILED', reason=str(e))
+
+  ParseELB:
+    Type: Custom::ParseELB
+    Properties:
+      ServiceToken: !GetAtt ParseELBFunction.Arn
+      ELBName: !Ref ELBName
+      ELBType: !Ref ELBType
+      TMTSubnets: !Ref TrafficMirroringTargetSubnets
+
+  # ============================================================
+  # S3 Bucket
+  # ============================================================
+  PcapBucket:
+    Type: AWS::S3::Bucket
+    Condition: CreateBucket
+    DeletionPolicy: Retain
+    Properties:
+      BucketName: !Sub "${ParseELB.TagPrefix}-${ParseELB.SanitizedStackName}-pcap"
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: aws:kms
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+
+  # ============================================================
+  # IAM Role for EC2
+  # ============================================================
+  TMTRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "tms-create-stack-${ParseELB.TagPrefix}-${ParseELB.SanitizedStackName}-ec2-role"
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: S3PutObject
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:PutObject
+                  - s3:GetBucketLocation
+                  - s3:ListBucket
+                Resource:
+                  - !If
+                    - CreateBucket
+                    - !Sub "arn:aws:s3:::${ParseELB.TagPrefix}-${ParseELB.SanitizedStackName}-pcap"
+                    - !Ref ExistingBucketArn
+                  - !If
+                    - CreateBucket
+                    - !Sub "arn:aws:s3:::${ParseELB.TagPrefix}-${ParseELB.SanitizedStackName}-pcap/*"
+                    - !Sub "${ExistingBucketArn}/*"
+
+  TMTInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      InstanceProfileName: !Sub "tms-create-stack-${ParseELB.TagPrefix}-${ParseELB.SanitizedStackName}-ec2-instance-profile"
+      Roles:
+        - !Ref TMTRole
+
+  # ============================================================
+  # Security Group
+  # ============================================================
+  TMTSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Traffic Mirror Target EC2 - VXLAN ingress
+      VpcId: !GetAtt ParseELB.VpcId
+      SecurityGroupIngress:
+        - IpProtocol: udp
+          FromPort: 4789
+          ToPort: 4789
+          CidrIp: !GetAtt ParseELB.VpcCidr
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: !GetAtt ParseELB.VpcCidr
+      SecurityGroupEgress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          DestinationPrefixListId: !GetAtt ParseELB.S3PrefixListId
+        - IpProtocol: "-1"
+          CidrIp: !GetAtt ParseELB.VpcCidr
+      Tags:
+        - Key: Name
+          Value: !Sub "${ParseELB.TagPrefix}-${ParseELB.SanitizedStackName}-sg"
+
+  # ============================================================
+  # Traffic Mirror Filter
+  # ============================================================
+  TrafficMirrorFilter:
+    Type: AWS::EC2::TrafficMirrorFilter
+    Properties:
+      Description: !Sub "${ParseELB.TagPrefix}-${ParseELB.SanitizedStackName}-tm-filter"
+
+  TrafficMirrorFilterRuleIngress:
+    Type: AWS::EC2::TrafficMirrorFilterRule
+    Properties:
+      TrafficMirrorFilterId: !Ref TrafficMirrorFilter
+      RuleNumber: 1
+      RuleAction: accept
+      TrafficDirection: ingress
+      SourceCidrBlock: 0.0.0.0/0
+      DestinationCidrBlock: 0.0.0.0/0
+
+  TrafficMirrorFilterRuleEgress:
+    Type: AWS::EC2::TrafficMirrorFilterRule
+    Properties:
+      TrafficMirrorFilterId: !Ref TrafficMirrorFilter
+      RuleNumber: 1
+      RuleAction: accept
+      TrafficDirection: egress
+      SourceCidrBlock: 0.0.0.0/0
+      DestinationCidrBlock: 0.0.0.0/0
+
+  # ============================================================
+  # Traffic Mirror Target EC2 (AZ-based, fixed by CloudFormation)
+  # Uses Custom Resource to create EC2 per AZ with UserData
+  # ============================================================
+  TrafficMirrorController:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "${ParseELB.TagPrefix}-${ParseELB.SanitizedStackName}-controller"
+      Runtime: python3.12
+      Handler: index.handler
+      Role: !GetAtt MirrorSessionCreatorRole.Arn
+      Timeout: 300
+      Environment:
+        Variables:
+          SECURITY_GROUP_ID: !Ref TMTSecurityGroup
+          INSTANCE_PROFILE_ARN: !GetAtt TMTInstanceProfile.Arn
+          AMI_ID: !Sub "{{resolve:ssm:/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64}}"
+          INSTANCE_TYPE: !Ref TrafficMirroringTargetInstanceType
+          VNI: 12345
+          S3_BUCKET: !If
+            - CreateBucket
+            - !Sub "${ParseELB.TagPrefix}-${ParseELB.SanitizedStackName}-pcap"
+            - !Select [5, !Split [":", !Ref ExistingBucketArn]]
+          SUBNET_MAP: !GetAtt ParseELB.SubnetMapping
+          ALB_NAME: !GetAtt ParseELB.ELBName
+          TAG_PREFIX: !GetAtt ParseELB.TagPrefix
+          STACK_NAME: !Ref AWS::StackName
+          KEY_PAIR_NAME: !Ref KeyPairName
+          EC2_ROLE_NAME: !Ref TMTRole
+          PCAP_ROTATE_SECONDS: !Ref PcapRotateSeconds
+          PCAP_MAX_SIZE_MB: !Ref PcapMaxSizeMB
+          PCAP_SNAP_LEN: !Ref PcapSnapLen
+      Code:
+        ZipFile: |
+          import boto3, json, os, base64, logging
+          from urllib.request import urlopen, Request
+          
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+          ec2 = boto3.client('ec2')
+          iam = boto3.client('iam')
+          
+          def cfn_send(event, context, status, data={}, reason=''):
+              body = json.dumps({
+                  'Status': status,
+                  'Reason': reason or f'See CloudWatch Log Stream: {context.log_stream_name}',
+                  'PhysicalResourceId': context.log_stream_name,
+                  'StackId': event['StackId'],
+                  'RequestId': event['RequestId'],
+                  'LogicalResourceId': event['LogicalResourceId'],
+                  'Data': data
+              })
+              req = Request(event['ResponseURL'], data=body.encode(), method='PUT')
+              req.add_header('Content-Type', '')
+              req.add_header('Content-Length', str(len(body)))
+              urlopen(req)
+          
+          
+          def get_userdata(alb_name, az):
+              bucket = os.environ['S3_BUCKET']
+              vni = os.environ['VNI']
+              rotate_sec = os.environ['PCAP_ROTATE_SECONDS']
+              max_size_mb = os.environ['PCAP_MAX_SIZE_MB']
+              snap_len = os.environ['PCAP_SNAP_LEN']
+              script = f"""#!/bin/bash
+          VNI="{vni}"
+          ALB_NAME="{alb_name}"
+          AZ="{az}"
+          INTERFACE=$(ip -o link show | awk -F': ' '/^2:/{{print $2}}')
+          TOKEN=$(curl -s -X PUT "http://169.254.169.254/latest/api/token" -H "X-aws-ec2-metadata-token-ttl-seconds: 21600")
+          LOCAL_IP=$(curl -s -H "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.254/latest/meta-data/local-ipv4)
+          mkdir -p /tms
+          cat <<EOF > /opt/vxlan-setup.sh
+          #!/bin/bash
+          ip link add vxlan1 type vxlan id ${{VNI}} dev ${{INTERFACE}} dstport 4789 local ${{LOCAL_IP}}
+          ip link set vxlan1 up
+          EOF
+          chmod +x /opt/vxlan-setup.sh
+          cat <<EOF > /etc/systemd/system/vxlan-setup.service
+          [Unit]
+          Description=VXLAN interface setup
+          After=network.target
+          [Service]
+          Type=oneshot
+          ExecStart=/opt/vxlan-setup.sh
+          RemainAfterExit=yes
+          [Install]
+          WantedBy=multi-user.target
+          EOF
+          cat <<EOF > /etc/systemd/system/tcpdump-mirror.service
+          [Unit]
+          Description=tcpdump traffic mirror capture
+          After=vxlan-setup.service
+          Requires=vxlan-setup.service
+          Before=pcap-uploader.service
+          [Service]
+          ExecStart=/usr/sbin/tcpdump -i vxlan1 -s {snap_len} -w /tms/${{ALB_NAME}}_${{AZ}}_capture_%%Y%%m%%d_%%H%%M%%S.pcap -G {rotate_sec} -C {max_size_mb} -Z root
+          Restart=always
+          RestartSec=3
+          [Install]
+          WantedBy=multi-user.target
+          EOF
+          cat <<'SCRIPT' > /opt/pcap-uploader.sh
+          #!/bin/bash
+          WATCH_DIR="/tms"
+          while true; do
+            for f in ${{WATCH_DIR}}/*.pcap*; do
+              [ -f "$f" ] || continue
+              BASENAME=$(basename "$f")
+              if ! lsof "$f" &>/dev/null; then
+                DATE_RAW=$(echo "$BASENAME" | grep -oP '\\d{{8}}_\\d{{2}}' | head -1)
+                DATE_PATH="${{DATE_RAW:0:4}}/${{DATE_RAW:4:2}}/${{DATE_RAW:6:2}}/${{DATE_RAW:9:2}}"
+                aws s3 cp "$f" "s3://{bucket}/${{DATE_PATH}}/${{BASENAME}}" && rm -f "$f"
+              fi
+            done
+            sleep 5
+          done
+          SCRIPT
+          chmod +x /opt/pcap-uploader.sh
+          cat <<'STOPSCRIPT' > /opt/pcap-final-upload.sh
+          #!/bin/bash
+          pkill -f "tcpdump -i vxlan1" || true
+          sleep 2
+          WATCH_DIR="/tms"
+          for f in ${{WATCH_DIR}}/*.pcap*; do
+            [ -f "$f" ] || continue
+            BASENAME=$(basename "$f")
+            DATE_RAW=$(echo "$BASENAME" | grep -oP '\\d{{8}}_\\d{{2}}' | head -1)
+            DATE_PATH="${{DATE_RAW:0:4}}/${{DATE_RAW:4:2}}/${{DATE_RAW:6:2}}/${{DATE_RAW:9:2}}"
+            aws s3 cp "$f" "s3://{bucket}/${{DATE_PATH}}/${{BASENAME}}"
+          done
+          STOPSCRIPT
+          chmod +x /opt/pcap-final-upload.sh
+          cat <<EOF > /etc/systemd/system/pcap-uploader.service
+          [Unit]
+          Description=PCAP to S3 uploader (polling)
+          After=tcpdump-mirror.service
+          [Service]
+          ExecStart=/opt/pcap-uploader.sh
+          ExecStop=/opt/pcap-final-upload.sh
+          Restart=always
+          RestartSec=3
+          TimeoutStopSec=120
+          [Install]
+          WantedBy=multi-user.target
+          EOF
+          systemctl daemon-reload
+          systemctl enable --now vxlan-setup
+          systemctl enable --now tcpdump-mirror
+          systemctl enable --now pcap-uploader
+          """
+              return base64.b64encode(script.encode()).decode()
+          
+          
+          def handler(event, context):
+              logger.info(f'Event: {json.dumps(event)}')
+              if event['RequestType'] == 'Delete':
+                  try:
+                      p = os.environ['TAG_PREFIX']
+                      stack_name = os.environ['STACK_NAME']
+                      delete_mirror_sessions(p, stack_name)
+                      delete_mirror_targets(p, stack_name)
+                      delete_TMT_ec2s(p, stack_name)
+                      ec2_role_name = os.environ.get('EC2_ROLE_NAME', '')
+                      detach_attached_policies_in(ec2_role_name)
+                  except Exception as e:
+                      logger.error(f'Delete cleanup error (non-fatal): {e}')
+                  cfn_send(event, context, 'SUCCESS')
+                  return
+              try:
+                  subnet_map = json.loads(os.environ['SUBNET_MAP'])
+                  p = os.environ['TAG_PREFIX']
+          
+                  instance_ids = create_TMT_ec2s(p, subnet_map)
+          
+                  # Wait all running
+                  wait_instances_running(instance_ids)
+          
+                  # Create Mirror Targets
+                  az_target_map = create_mirror_targets(instance_ids, p)
+          
+                  cfn_send(event, context, 'SUCCESS', {'AZTargetMap': json.dumps(az_target_map)})
+              except Exception as e:
+                  logger.error(f'Error: {str(e)}')
+                  cfn_send(event, context, 'FAILED', reason=str(e))
+          
+          
+          def create_mirror_targets(instance_ids, p) -> dict:
+              az_target_map = {}
+              for iid in instance_ids:
+                  info = ec2.describe_instances(InstanceIds=[iid])
+                  inst = info['Reservations'][0]['Instances'][0]
+                  eni_id = inst['NetworkInterfaces'][0]['NetworkInterfaceId']
+                  az = inst['Placement']['AvailabilityZone']
+                  target = ec2.create_traffic_mirror_target(
+                      NetworkInterfaceId=eni_id,
+                      Description=f'TMT-{az}',
+                      TagSpecifications=[{'ResourceType': 'traffic-mirror-target', 'Tags': [
+                          {'Key': 'Name', 'Value': f'TMT-{az}'},
+                          {'Key': f'{p}:cloudformation:stack-name', 'Value': os.environ['STACK_NAME']},
+                          {'Key': f'{p}:AZ', 'Value': az}
+                      ]}]
+                  )
+                  tid = target['TrafficMirrorTarget']['TrafficMirrorTargetId']
+                  az_target_map[az] = tid
+                  logger.info(f'Created Mirror Target {tid} for AZ {az}')
+              return az_target_map
+          
+          
+          def wait_instances_running(instance_ids):
+              waiter = ec2.get_waiter('instance_running')
+              waiter.wait(InstanceIds=instance_ids)
+          
+          
+          def create_TMT_ec2s(p, subnet_map) -> list:
+              instance_ids = []
+              for az, subnet_id in subnet_map.items():
+                  tags = [
+                      {'Key': 'Name', 'Value': f'TMT-{az}'},
+                      {'Key': f'{p}:cloudformation:stack-name', 'Value': os.environ['STACK_NAME']},
+                      {'Key': f'{p}:AZ', 'Value': az},
+                      {'Key': 'tms-create-stack:managed', 'Value': 'true'},
+                      {'Key': 'tms-create-stack:stackname', 'Value': os.environ['STACK_NAME']}
+                  ]
+                  run_params = dict(
+                      ImageId=os.environ['AMI_ID'],
+                      InstanceType=os.environ['INSTANCE_TYPE'],
+                      MinCount=1, MaxCount=1,
+                      NetworkInterfaces=[{
+                          'DeviceIndex': 0,
+                          'SubnetId': subnet_id,
+                          'Groups': [os.environ['SECURITY_GROUP_ID']],
+                          'AssociatePublicIpAddress': False
+                      }],
+                      IamInstanceProfile={'Arn': os.environ['INSTANCE_PROFILE_ARN']},
+                      UserData=get_userdata(os.environ.get('ALB_NAME', 'alb'), az),
+                      TagSpecifications=[{'ResourceType': 'instance', 'Tags': tags}],
+                      MetadataOptions={'HttpTokens': 'required', 'HttpPutResponseHopLimit': 1, 'HttpEndpoint': 'enabled'}
+                  )
+                  if os.environ.get('KEY_PAIR_NAME'):
+                      run_params['KeyName'] = os.environ['KEY_PAIR_NAME']
+                  instance = ec2.run_instances(**run_params)
+                  iid = instance['Instances'][0]['InstanceId']
+                  instance_ids.append(iid)
+                  logger.info(f'Created EC2 {iid} in AZ {az}')
+              return instance_ids
+          
+          
+          def detach_attached_policies_in(ec2_role_name):
+              if ec2_role_name:
+                  try:
+                      attached = iam.list_attached_role_policies(RoleName=ec2_role_name)
+                      for policy in attached.get('AttachedPolicies', []):
+                          logger.info(f'Detaching policy {policy["PolicyArn"]} from {ec2_role_name}')
+                          iam.detach_role_policy(RoleName=ec2_role_name, PolicyArn=policy['PolicyArn'])
+                  except Exception as e:
+                      logger.warning(f'Non-fatal: failed to detach policies from {ec2_role_name}: {e}')
+          
+          
+          def delete_TMT_ec2s(p, stack_name):
+              instances = ec2.describe_instances(
+                  Filters=[
+                      {'Name': f'tag:{p}:cloudformation:stack-name', 'Values': [stack_name]},
+                      {'Name': 'instance-state-name', 'Values': ['running', 'stopped']}
+                  ]
+              )
+              ids = [i['InstanceId'] for r in instances['Reservations'] for i in r['Instances']]
+              if ids:
+                  logger.info(f'Terminating: {ids}')
+                  ec2.terminate_instances(InstanceIds=ids)
+          
+          
+          def delete_mirror_targets(p, stack_name):
+              targets = ec2.describe_traffic_mirror_targets(
+                  Filters=[{'Name': f'tag:{p}:cloudformation:stack-name', 'Values': [stack_name]}]
+              )
+              for t in targets['TrafficMirrorTargets']:
+                  logger.info(f'Deleting Mirror Target: {t["TrafficMirrorTargetId"]}')
+                  ec2.delete_traffic_mirror_target(TrafficMirrorTargetId=t['TrafficMirrorTargetId'])
+          
+          
+          def delete_mirror_sessions(p, stack_name):
+              sessions = ec2.describe_traffic_mirror_sessions(
+                  Filters=[{'Name': f'tag:{p}:cloudformation:stack-name', 'Values': [stack_name]}]
+              )
+              for s in sessions['TrafficMirrorSessions']:
+                  logger.info(f'Deleting Mirror Session: {s["TrafficMirrorSessionId"]}')
+                  ec2.delete_traffic_mirror_session(TrafficMirrorSessionId=s['TrafficMirrorSessionId'])
+
+  TrafficMirrorResource:
+    Type: Custom::TMTEc2
+    DependsOn:
+      - TMTSecurityGroup
+      - TMTInstanceProfile
+      - TrafficMirrorFilter
+    Properties:
+      ServiceToken: !GetAtt TrafficMirrorController.Arn
+
+  # ============================================================
+  # Common Lambda Role (shared by all lambdas)
+  # ============================================================
+  MirrorSessionCreatorRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "tms-create-stack-${ParseELB.TagPrefix}-${ParseELB.SanitizedStackName}-lamb-msc-role"
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: TMPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: RunInstances
+                Effect: Allow
+                Action:
+                  - ec2:RunInstances
+                Resource: "*"
+                Condition:
+                  StringEquals:
+                    "aws:RequestedRegion": !Ref "AWS::Region"
+              - Sid: EC2Other
+                Effect: Allow
+                Action:
+                  - ec2:CreateTags
+                  - ec2:DescribeInstances
+                  - ec2:DescribeNetworkInterfaces
+                  - ec2:CreateTrafficMirrorTarget
+                  - ec2:DeleteTrafficMirrorTarget
+                  - ec2:CreateTrafficMirrorSession
+                  - ec2:DeleteTrafficMirrorSession
+                  - ec2:DescribeTrafficMirrorSessions
+                  - ec2:DescribeTrafficMirrorTargets
+                Resource: "*"
+              - Sid: EC2Terminate
+                Effect: Allow
+                Action:
+                  - ec2:TerminateInstances
+                Resource: "*"
+                Condition:
+                  StringEquals:
+                    "ec2:ResourceTag/tms-create-stack:managed": "true"
+                    "ec2:ResourceTag/tms-create-stack:stackname": !Ref "AWS::StackName"
+              - Sid: PassRole
+                Effect: Allow
+                Action:
+                  - iam:PassRole
+                Resource: !GetAtt TMTRole.Arn
+              - Sid: DetachEC2RolePolicy
+                Effect: Allow
+                Action:
+                  - iam:ListAttachedRolePolicies
+                  - iam:DetachRolePolicy
+                Resource: !GetAtt TMTRole.Arn
+
+  # ============================================================
+  # Common Lambda (creates Mirror Session only)
+  # ============================================================
+  MirrorSessionCreator:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "${ParseELB.TagPrefix}-${ParseELB.SanitizedStackName}-mirror-session-creator"
+      Runtime: python3.12
+      Handler: index.handler
+      Timeout: 600
+      Role: !GetAtt MirrorSessionCreatorRole.Arn
+      Environment:
+        Variables:
+          MIRROR_FILTER_ID: !Ref TrafficMirrorFilter
+          VNI: 12345
+          TAG_PREFIX: !GetAtt ParseELB.TagPrefix
+          STACK_NAME: !Ref AWS::StackName
+          AZ_TARGET_MAP: !GetAtt TrafficMirrorResource.AZTargetMap
+      Code:
+        ZipFile: |
+          import boto3, json, os, logging, time
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+          ec2 = boto3.client('ec2')
+
+          def retry(max_attempts=3, interval=60):
+              def decorator(func):
+                  def wrapper(*args, **kwargs):
+                      for attempt in range(max_attempts):
+                          try:
+                              return func(*args, **kwargs)
+                          except Exception as e:
+                              if attempt == max_attempts - 1:
+                                  raise
+                              logger.warning(f'{func.__name__} retry {attempt+1}/{max_attempts}: {e}')
+                              time.sleep(interval)
+                  return wrapper
+              return decorator
+
+          def is_duplicate(eni_id):
+              existing = ec2.describe_traffic_mirror_sessions(Filters=[{'Name': 'network-interface-id', 'Values': [eni_id]}])
+              return len(existing['TrafficMirrorSessions']) > 0
+
+          @retry(max_attempts=3, interval=60)
+          def create_mirror_session(eni_id, target_id, tags):
+              logger.info(f'Creating Mirror Session: source={eni_id}, target={target_id}')
+              ec2.create_traffic_mirror_session(
+                  NetworkInterfaceId=eni_id, TrafficMirrorTargetId=target_id,
+                  TrafficMirrorFilterId=os.environ['MIRROR_FILTER_ID'],
+                  SessionNumber=1, VirtualNetworkId=int(os.environ['VNI']),
+                  Description=f'Mirror session for {eni_id}',
+                  TagSpecifications=[{'ResourceType': 'traffic-mirror-session', 'Tags': tags}]
+              )
+              logger.info(f'Mirror Session created for {eni_id}')
+
+          def TMTSelector(az, az_target_map):
+              """Select best Mirror Target: same AZ preferred, otherwise least-loaded Target."""
+              # 1. Same AZ match
+              if az in az_target_map:
+                  logger.info(f'TMTSelector: same AZ match for {az}')
+                  return az_target_map[az]
+              # 2. Load balance: pick target with fewest sessions
+              all_target_ids = list(az_target_map.values())
+              sessions = ec2.describe_traffic_mirror_sessions(Filters=[{'Name': 'traffic-mirror-target-id', 'Values': all_target_ids}])
+              target_counts = {tid: 0 for tid in all_target_ids}
+              for s in sessions.get('TrafficMirrorSessions', []):
+                  tid = s['TrafficMirrorTargetId']
+                  if tid in target_counts:
+                      target_counts[tid] += 1
+              selected = min(target_counts, key=target_counts.get)
+              logger.info(f'TMTSelector: no target in {az}, selected {selected} (sessions: {target_counts})')
+              return selected
+
+          def handler(event, context):
+              logger.info(f'Event: {json.dumps(event)}')
+              # Parse ENI info
+              if 'detail' in event:
+                  detail = event['detail']
+                  eni_id = detail['responseElements']['networkInterface']['networkInterfaceId']
+                  az = detail['responseElements']['networkInterface']['availabilityZone']
+              else:
+                  eni_id = event['eni_id']
+                  az = event['availability_zone']
+
+              if is_duplicate(eni_id):
+                  logger.info(f'Mirror session already exists for {eni_id}, skipping')
+                  return {'statusCode': 200, 'body': f'Already exists for {eni_id}'}
+
+              # Find target using TMTSelector
+              az_target_map = json.loads(os.environ['AZ_TARGET_MAP'])
+              target_id = TMTSelector(az, az_target_map)
+
+              p = os.environ['TAG_PREFIX']
+              tags = [
+                  {'Key': 'Name', 'Value': f'TMS-{eni_id}'},
+                  {'Key': f'{p}:cloudformation:stack-name', 'Value': os.environ['STACK_NAME']},
+                  {'Key': f'{p}:SourceENI', 'Value': eni_id}
+              ]
+              create_mirror_session(eni_id, target_id, tags)
+              return {'statusCode': 200, 'body': f'Mirror Session created for {eni_id}'}
+
+  # ============================================================
+  # Initial Lambda (queries existing ENIs, invokes Common)
+  # ============================================================
+  InitialLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "tms-create-stack-${ParseELB.TagPrefix}-${ParseELB.SanitizedStackName}-lamb-init-role"
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: InitialPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ec2:DescribeNetworkInterfaces
+                Resource: "*"
+              - Effect: Allow
+                Action:
+                  - lambda:InvokeFunction
+                Resource: !GetAtt MirrorSessionCreator.Arn
+
+  InitialLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "${ParseELB.TagPrefix}-${ParseELB.SanitizedStackName}-initial"
+      Runtime: python3.12
+      Handler: index.handler
+      Timeout: 60
+      Role: !GetAtt InitialLambdaRole.Arn
+      Environment:
+        Variables:
+          ALB_DESCRIPTION: !GetAtt ParseELB.ENIDescription
+          MIRROR_SESSION_CREATOR_NAME: !Ref MirrorSessionCreator
+      Code:
+        ZipFile: |
+          import boto3, json, os, logging
+          from dataclasses import dataclass
+          from urllib.request import urlopen, Request
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+          ec2 = boto3.client('ec2')
+          lambda_client = boto3.client('lambda')
+
+          @dataclass
+          class StackEvent:
+              alb_description: str
+              common_lambda_name: str
+              def __post_init__(self):
+                  if not self.alb_description: raise ValueError('ALB_DESCRIPTION must not be empty')
+                  if not self.common_lambda_name: raise ValueError('MIRROR_SESSION_CREATOR_NAME must not be empty')
+
+          def parseEvent():
+              return StackEvent(alb_description=os.environ.get('ALB_DESCRIPTION', ''), common_lambda_name=os.environ.get('MIRROR_SESSION_CREATOR_NAME', ''))
+
+          @dataclass
+          class AlbEni:
+              eni_id: str
+              availability_zone: str
+              @staticmethod
+              def from_aws_response(describeApiResult):
+                  return AlbEni(eni_id=describeApiResult['NetworkInterfaceId'], availability_zone=describeApiResult['AvailabilityZone'])
+
+          def cfn_send(event, context, status, data={}, reason=''):
+              body = json.dumps({'Status': status, 'Reason': reason or f'See CloudWatch Log Stream: {context.log_stream_name}', 'PhysicalResourceId': context.log_stream_name, 'StackId': event['StackId'], 'RequestId': event['RequestId'], 'LogicalResourceId': event['LogicalResourceId'], 'Data': data})
+              req = Request(event['ResponseURL'], data=body.encode(), method='PUT')
+              req.add_header('Content-Type', '')
+              req.add_header('Content-Length', str(len(body)))
+              urlopen(req)
+
+          def handler(event, context):
+              logger.info(f'Event: {json.dumps(event)}')
+              if event.get('RequestType') == 'Delete':
+                  cfn_send(event, context, 'SUCCESS')
+                  return
+              try:
+                  stackEvent = parseEvent()
+                  resp = ec2.describe_network_interfaces(Filters=[{'Name': 'description', 'Values': [stackEvent.alb_description]}])
+                  albEnis = [AlbEni.from_aws_response(e) for e in resp['NetworkInterfaces']]
+                  logger.info(f'Found {len(albEnis)} ENIs for {stackEvent.alb_description}')
+                  for eni in albEnis:
+                      payload = {'eni_id': eni.eni_id, 'availability_zone': eni.availability_zone}
+                      logger.info(f'Invoking common lambda for: {payload}')
+                      lambda_client.invoke(FunctionName=stackEvent.common_lambda_name, InvocationType='Event', Payload=json.dumps(payload))
+                  if 'ResponseURL' in event:
+                      cfn_send(event, context, 'SUCCESS', {'ENICount': str(len(albEnis))})
+                  return {'statusCode': 200, 'body': f'Invoked for {len(albEnis)} ENIs'}
+              except Exception as e:
+                  logger.error(f'Error: {str(e)}', exc_info=True)
+                  if 'ResponseURL' in event:
+                      cfn_send(event, context, 'FAILED', reason=str(e))
+                  raise
+
+  # ============================================================
+  # EventBridge Rule (CreateNetworkInterface)
+  # ============================================================
+  EventBridgeRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub "${ParseELB.TagPrefix}-${ParseELB.SanitizedStackName}-eni-created"
+      State: ENABLED
+      EventPattern:
+        source:
+          - aws.ec2
+        detail-type:
+          - "AWS API Call via CloudTrail"
+        detail:
+          eventSource:
+            - ec2.amazonaws.com
+          eventName:
+            - CreateNetworkInterface
+          requestParameters:
+            description:
+              - !GetAtt ParseELB.ENIDescription
+      Targets:
+        - Id: mirror-session-creator-target
+          Arn: !GetAtt MirrorSessionCreator.Arn
+
+  EventBridgeLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref MirrorSessionCreator
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt EventBridgeRule.Arn
+
+  # ============================================================
+  # Run Initial Lambda (auto-execute on stack creation)
+  # ============================================================
+  RunInitialLambda:
+    Type: Custom::RunInitial
+    DependsOn:
+      - InitialLambda
+      - MirrorSessionCreator
+      - EventBridgeRule
+      - TrafficMirrorResource
+    Properties:
+      ServiceToken: !GetAtt InitialLambda.Arn
+
+Outputs:
+  S3Bucket:
+    Value: !If [CreateBucket, !Ref PcapBucket, !Select [5, !Split [":", !Ref ExistingBucketArn]]]
+  MirrorSessionCreatorArn:
+    Value: !GetAtt MirrorSessionCreator.Arn
+  InitialLambdaArn:
+    Value: !GetAtt InitialLambda.Arn
+  TrafficMirrorFilterId:
+    Value: !Ref TrafficMirrorFilter
+  TagPrefix:
+    Value: !GetAtt ParseELB.TagPrefix
+  AZTargetMap:
+    Value: !GetAtt TrafficMirrorResource.AZTargetMap
