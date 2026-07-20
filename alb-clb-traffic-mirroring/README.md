@@ -103,3 +103,34 @@ A background uploader service runs every 5 seconds and uploads completed pcap fi
 | `-G` | PcapRotateSeconds | Rotate the pcap file every N seconds. Each rotated file is immediately eligible for S3 upload. Lower values = more frequent uploads but more small files. |
 | `-C` | PcapMaxSizeMB | Rotate the pcap file when it reaches N MB. Prevents excessively large files on high-traffic ALBs. |
 | `-s` | PcapSnapLen | Capture only the first N bytes of each packet. Use `0` for full packet capture. Set to e.g. `96` to capture headers only (reduces file size significantly). |
+
+---
+
+## Cost Considerations
+
+This stack provisions always-on infrastructure that incurs charges until the stack is deleted. Delete the stack when your capture campaign is complete.
+
+### EC2 Instances
+One instance runs per selected subnet, 24/7. The default instance type is `c5.xlarge`. You can choose a smaller type (e.g., `t3.small`) for low-throughput scenarios.
+- Pricing: https://aws.amazon.com/ec2/pricing/on-demand/
+
+### VPC Traffic Mirroring
+One mirror session is created per ALB/CLB ENI and billed per hour while active. The session count scales automatically as the ALB/CLB scales out — cost grows with node count without further user action.
+- Pricing: https://aws.amazon.com/vpc/pricing/ (Network Analysis tab)
+
+### S3 Storage & KMS
+Pcap files accumulate continuously in S3 with KMS encryption. The bucket is preserved after stack deletion (`DeletionPolicy: Retain`), so storage costs continue until you manually empty and delete the bucket.
+- Storage & Requests pricing: https://aws.amazon.com/s3/pricing/ (Storage & Requests tab)
+- KMS encryption pricing: https://aws.amazon.com/s3/pricing/ (Security & buckets tab)
+
+### Cross-AZ Data Transfer
+If the mirror source (ALB/CLB ENI) and mirror target (EC2) are in different AZs, standard cross-AZ data transfer charges apply. To minimize this cost, select subnets in the same AZs as the ALB/CLB.
+
+### S3 Data Transfer
+EC2 instances upload pcap files to S3 continuously. The data transfer cost depends on the route to S3:
+- **S3 Gateway Endpoint**: No data transfer charge (recommended)
+- **S3 Interface Endpoint**: Per-hour endpoint charge + data processing charge
+- **NAT Gateway**: Per-hour charge + data processing charge ($0.045/GB)
+- **Internet Gateway**: Standard data transfer out charges
+
+Using an S3 Gateway Endpoint is recommended as it incurs no data transfer cost.
