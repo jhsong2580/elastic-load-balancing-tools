@@ -123,6 +123,8 @@ Pcap files accumulate continuously in S3 with KMS encryption. The bucket is pres
 - Storage & Requests pricing: https://aws.amazon.com/s3/pricing/ (Storage & Requests tab)
 - KMS encryption pricing: https://aws.amazon.com/s3/pricing/ (Security & buckets tab)
 
+**Tip**: If you don't need full application-layer payloads, set `PcapSnapLen` to a smaller value (e.g., `96` for headers only). This significantly reduces pcap file sizes, lowering both S3 storage costs and data transfer costs. Note that by default (`PcapSnapLen=0`), full packets are captured — which may include decrypted HTTP payloads (post TLS termination), session cookies, Authorization headers, and other sensitive data.
+
 ### Cross-AZ Data Transfer
 If the mirror source (ALB/CLB ENI) and mirror target (EC2) are in different AZs, standard cross-AZ data transfer charges apply. To minimize this cost, select subnets in the same AZs as the ALB/CLB.
 
