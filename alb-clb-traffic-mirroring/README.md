@@ -64,7 +64,7 @@ This eliminates the need for the manual 9-step Traffic Mirroring setup process a
 |------------------------------------|---------------------------------------------|-----------------------------------------|
 | ELBName                            | Name of ALB or CLB to mirror                | `load-balancer-lab`                     |
 | ELBType                            | Type of load balancer                       | `ALB` or `CLB`                          |
-| TrafficMirroringTargetSubnets      | Subnets for mirror target EC2s (one per AZ) | Select from dropdown                    |
+| TrafficMirroringTargetSubnets      | Subnets for mirror target EC2s (same VPC as ALB/CLB). If fewer subnets than ALB/CLB AZs are selected, traffic from uncovered AZs is automatically routed cross-AZ. This works correctly but incurs cross-AZ data transfer charges. For cost optimization, select one subnet per ALB/CLB AZ. | Select from dropdown                    |
 | TrafficMirroringTargetInstanceType | EC2 instance type for capture               | `c5.xlarge` (default)                   |
 | ExistingBucketArn                  | (Optional) Existing S3 bucket ARN           | `arn:aws:s3:::my-bucket` or leave empty |
 | KeyPairName                        | (Optional) EC2 Key Pair for SSH access. Leave empty to launch without a login key. Note: TCP 22 is still open from VPC CIDR regardless. | Select from dropdown or leave empty     |
