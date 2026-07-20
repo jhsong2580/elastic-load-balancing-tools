@@ -81,7 +81,7 @@ Parameters:
   KeyPairName:
     Type: String
     Default: ""
-    Description: "EC2 Key Pair name for SSH access to TMT instances. Leave empty to launch without a login key. Note: TCP 22 is open from VPC CIDR regardless."
+    Description: "EC2 Key Pair name for SSH access to TMT instances. Leave empty for no SSH access."
   PcapRotateSeconds:
     Type: Number
     Default: 1800
@@ -132,17 +132,18 @@ Resources:
 
   ParseELBFunction:
     Type: AWS::Lambda::Function
+    DependsOn: ParseELBLogGroup
     Properties:
       FunctionName: !Sub
-        - "tms-create-stack-${StackUUID}-parse-elb"
-        - StackUUID: !Select [0, !Split ["-", !Select [2, !Split ["/", !Ref "AWS::StackId"]]]]
+        - "tm-parse-elb-${StackUUID}"
+        - StackUUID: !Select [2, !Split ["/", !Ref "AWS::StackId"]]
       Runtime: python3.12
       Handler: index.handler
       Role: !GetAtt ParseELBRole.Arn
       Timeout: 30
       Code:
         ZipFile: |
-          import boto3, json, logging
+          import boto3, json, logging, string, random
           from dataclasses import dataclass
           from urllib.request import urlopen, Request
           logger = logging.getLogger()
@@ -213,7 +214,7 @@ Resources:
                   cfn_send(event, context, 'SUCCESS')
                   return
               try:
-                  tag_prefix = event['StackId'].split('/')[2].split('-')[0]
+                  tag_prefix = ''.join(random.choices(string.ascii_lowercase + string.digits, k=10))
                   stackEvent = parseEvent(event)
                   sanitized_stack_name = stackEvent.stack_name[:15].lower()
                   logger.info(f'ELB: name={stackEvent.lb.name}, type={stackEvent.lb.lb_type}, vpc={stackEvent.lb.vpc_id}')
@@ -373,8 +374,11 @@ Resources:
   # ============================================================
   TrafficMirrorController:
     Type: AWS::Lambda::Function
+    DependsOn: TrafficMirrorControllerLogGroup
     Properties:
-      FunctionName: !Sub "${ParseELB.TagPrefix}-${ParseELB.SanitizedStackName}-controller"
+      FunctionName: !Sub
+        - "tm-controller-${StackUUID}"
+        - StackUUID: !Select [2, !Split ["/", !Ref "AWS::StackId"]]
       Runtime: python3.12
       Handler: index.handler
       Role: !GetAtt MirrorSessionCreatorRole.Arn
@@ -403,28 +407,17 @@ Resources:
         ZipFile: |
           import boto3, json, os, base64, logging
           from urllib.request import urlopen, Request
-          
           logger = logging.getLogger()
           logger.setLevel(logging.INFO)
           ec2 = boto3.client('ec2')
-          iam = boto3.client('iam')
-          
+
           def cfn_send(event, context, status, data={}, reason=''):
-              body = json.dumps({
-                  'Status': status,
-                  'Reason': reason or f'See CloudWatch Log Stream: {context.log_stream_name}',
-                  'PhysicalResourceId': context.log_stream_name,
-                  'StackId': event['StackId'],
-                  'RequestId': event['RequestId'],
-                  'LogicalResourceId': event['LogicalResourceId'],
-                  'Data': data
-              })
+              body = json.dumps({'Status': status, 'Reason': reason or f'See CloudWatch Log Stream: {context.log_stream_name}', 'PhysicalResourceId': context.log_stream_name, 'StackId': event['StackId'], 'RequestId': event['RequestId'], 'LogicalResourceId': event['LogicalResourceId'], 'Data': data})
               req = Request(event['ResponseURL'], data=body.encode(), method='PUT')
               req.add_header('Content-Type', '')
               req.add_header('Content-Length', str(len(body)))
               urlopen(req)
-          
-          
+
           def get_userdata(alb_name, az):
               bucket = os.environ['S3_BUCKET']
               vni = os.environ['VNI']
@@ -519,142 +512,69 @@ Resources:
           systemctl enable --now pcap-uploader
           """
               return base64.b64encode(script.encode()).decode()
-          
-          
+
           def handler(event, context):
               logger.info(f'Event: {json.dumps(event)}')
               if event['RequestType'] == 'Delete':
-                  try:
-                      p = os.environ['TAG_PREFIX']
-                      stack_name = os.environ['STACK_NAME']
-                      delete_mirror_sessions(p, stack_name)
-                      delete_mirror_targets(p, stack_name)
-                      delete_TMT_ec2s(p, stack_name)
-                      ec2_role_name = os.environ.get('EC2_ROLE_NAME', '')
-                      detach_attached_policies_in(ec2_role_name)
-                  except Exception as e:
-                      logger.error(f'Delete cleanup error (non-fatal): {e}')
+                  p = os.environ['TAG_PREFIX']
+                  stack_name = os.environ['STACK_NAME']
+                  # Delete Mirror Sessions
+                  sessions = ec2.describe_traffic_mirror_sessions(Filters=[{'Name': f'tag:{p}:cloudformation:stack-name', 'Values': [stack_name]}])
+                  for s in sessions['TrafficMirrorSessions']:
+                      logger.info(f'Deleting Mirror Session: {s["TrafficMirrorSessionId"]}')
+                      ec2.delete_traffic_mirror_session(TrafficMirrorSessionId=s['TrafficMirrorSessionId'])
+                  # Delete Mirror Targets
+                  targets = ec2.describe_traffic_mirror_targets(Filters=[{'Name': f'tag:{p}:cloudformation:stack-name', 'Values': [stack_name]}])
+                  for t in targets['TrafficMirrorTargets']:
+                      logger.info(f'Deleting Mirror Target: {t["TrafficMirrorTargetId"]}')
+                      ec2.delete_traffic_mirror_target(TrafficMirrorTargetId=t['TrafficMirrorTargetId'])
+                  # Terminate EC2s
+                  instances = ec2.describe_instances(Filters=[{'Name': f'tag:{p}:cloudformation:stack-name', 'Values': [stack_name]}, {'Name': 'instance-state-name', 'Values': ['running', 'stopped']}])
+                  ids = [i['InstanceId'] for r in instances['Reservations'] for i in r['Instances']]
+                  if ids:
+                      logger.info(f'Terminating: {ids}')
+                      ec2.terminate_instances(InstanceIds=ids)
+                  # Detach externally-attached policies from EC2 Role (e.g. SSM Patch Manager)
+                  iam = boto3.client('iam')
+                  ec2_role_name = os.environ.get('EC2_ROLE_NAME', '')
+                  if ec2_role_name:
+                      attached = iam.list_attached_role_policies(RoleName=ec2_role_name)
+                      for policy in attached.get('AttachedPolicies', []):
+                          logger.info(f'Detaching policy {policy["PolicyArn"]} from {ec2_role_name}')
+                          iam.detach_role_policy(RoleName=ec2_role_name, PolicyArn=policy['PolicyArn'])
                   cfn_send(event, context, 'SUCCESS')
                   return
               try:
                   subnet_map = json.loads(os.environ['SUBNET_MAP'])
                   p = os.environ['TAG_PREFIX']
-          
-                  instance_ids = create_TMT_ec2s(p, subnet_map)
-          
+                  instance_ids = []
+                  target_ids = []
+                  for az, subnet_id in subnet_map.items():
+                      tags = [{'Key': 'Name', 'Value': f'TMT-{az}'}, {'Key': f'{p}:cloudformation:stack-name', 'Value': os.environ['STACK_NAME']}, {'Key': f'{p}:AZ', 'Value': az}, {'Key': 'tms-create-stack:managed', 'Value': 'true'}, {'Key': 'tms-create-stack:stackname', 'Value': os.environ['STACK_NAME']}]
+                      run_params = dict(ImageId=os.environ['AMI_ID'], InstanceType=os.environ['INSTANCE_TYPE'], MinCount=1, MaxCount=1, NetworkInterfaces=[{'DeviceIndex': 0, 'SubnetId': subnet_id, 'Groups': [os.environ['SECURITY_GROUP_ID']], 'AssociatePublicIpAddress': False}], IamInstanceProfile={'Arn': os.environ['INSTANCE_PROFILE_ARN']}, UserData=get_userdata(os.environ.get('ALB_NAME', 'alb'), az), TagSpecifications=[{'ResourceType': 'instance', 'Tags': tags}], MetadataOptions={'HttpTokens': 'required', 'HttpPutResponseHopLimit': 1, 'HttpEndpoint': 'enabled'})
+                      if os.environ.get('KEY_PAIR_NAME'): run_params['KeyName'] = os.environ['KEY_PAIR_NAME']
+                      instance = ec2.run_instances(**run_params)
+                      iid = instance['Instances'][0]['InstanceId']
+                      instance_ids.append(iid)
+                      logger.info(f'Created EC2 {iid} in AZ {az}')
                   # Wait all running
-                  wait_instances_running(instance_ids)
-          
+                  waiter = ec2.get_waiter('instance_running')
+                  waiter.wait(InstanceIds=instance_ids)
                   # Create Mirror Targets
-                  az_target_map = create_mirror_targets(instance_ids, p)
-          
+                  az_target_map = {}
+                  for iid in instance_ids:
+                      info = ec2.describe_instances(InstanceIds=[iid])
+                      inst = info['Reservations'][0]['Instances'][0]
+                      eni_id = inst['NetworkInterfaces'][0]['NetworkInterfaceId']
+                      az = inst['Placement']['AvailabilityZone']
+                      target = ec2.create_traffic_mirror_target(NetworkInterfaceId=eni_id, Description=f'TMT-{az}', TagSpecifications=[{'ResourceType': 'traffic-mirror-target', 'Tags': [{'Key': 'Name', 'Value': f'TMT-{az}'}, {'Key': f'{p}:cloudformation:stack-name', 'Value': os.environ['STACK_NAME']}, {'Key': f'{p}:AZ', 'Value': az}]}])
+                      tid = target['TrafficMirrorTarget']['TrafficMirrorTargetId']
+                      az_target_map[az] = tid
+                      logger.info(f'Created Mirror Target {tid} for AZ {az}')
                   cfn_send(event, context, 'SUCCESS', {'AZTargetMap': json.dumps(az_target_map)})
               except Exception as e:
                   logger.error(f'Error: {str(e)}')
                   cfn_send(event, context, 'FAILED', reason=str(e))
-          
-          
-          def create_mirror_targets(instance_ids, p) -> dict:
-              az_target_map = {}
-              for iid in instance_ids:
-                  info = ec2.describe_instances(InstanceIds=[iid])
-                  inst = info['Reservations'][0]['Instances'][0]
-                  eni_id = inst['NetworkInterfaces'][0]['NetworkInterfaceId']
-                  az = inst['Placement']['AvailabilityZone']
-                  target = ec2.create_traffic_mirror_target(
-                      NetworkInterfaceId=eni_id,
-                      Description=f'TMT-{az}',
-                      TagSpecifications=[{'ResourceType': 'traffic-mirror-target', 'Tags': [
-                          {'Key': 'Name', 'Value': f'TMT-{az}'},
-                          {'Key': f'{p}:cloudformation:stack-name', 'Value': os.environ['STACK_NAME']},
-                          {'Key': f'{p}:AZ', 'Value': az}
-                      ]}]
-                  )
-                  tid = target['TrafficMirrorTarget']['TrafficMirrorTargetId']
-                  az_target_map[az] = tid
-                  logger.info(f'Created Mirror Target {tid} for AZ {az}')
-              return az_target_map
-          
-          
-          def wait_instances_running(instance_ids):
-              waiter = ec2.get_waiter('instance_running')
-              waiter.wait(InstanceIds=instance_ids)
-          
-          
-          def create_TMT_ec2s(p, subnet_map) -> list:
-              instance_ids = []
-              for az, subnet_id in subnet_map.items():
-                  tags = [
-                      {'Key': 'Name', 'Value': f'TMT-{az}'},
-                      {'Key': f'{p}:cloudformation:stack-name', 'Value': os.environ['STACK_NAME']},
-                      {'Key': f'{p}:AZ', 'Value': az},
-                      {'Key': 'tms-create-stack:managed', 'Value': 'true'},
-                      {'Key': 'tms-create-stack:stackname', 'Value': os.environ['STACK_NAME']}
-                  ]
-                  run_params = dict(
-                      ImageId=os.environ['AMI_ID'],
-                      InstanceType=os.environ['INSTANCE_TYPE'],
-                      MinCount=1, MaxCount=1,
-                      NetworkInterfaces=[{
-                          'DeviceIndex': 0,
-                          'SubnetId': subnet_id,
-                          'Groups': [os.environ['SECURITY_GROUP_ID']],
-                          'AssociatePublicIpAddress': False
-                      }],
-                      IamInstanceProfile={'Arn': os.environ['INSTANCE_PROFILE_ARN']},
-                      UserData=get_userdata(os.environ.get('ALB_NAME', 'alb'), az),
-                      TagSpecifications=[{'ResourceType': 'instance', 'Tags': tags}],
-                      MetadataOptions={'HttpTokens': 'required', 'HttpPutResponseHopLimit': 1, 'HttpEndpoint': 'enabled'}
-                  )
-                  if os.environ.get('KEY_PAIR_NAME'):
-                      run_params['KeyName'] = os.environ['KEY_PAIR_NAME']
-                  instance = ec2.run_instances(**run_params)
-                  iid = instance['Instances'][0]['InstanceId']
-                  instance_ids.append(iid)
-                  logger.info(f'Created EC2 {iid} in AZ {az}')
-              return instance_ids
-          
-          
-          def detach_attached_policies_in(ec2_role_name):
-              if ec2_role_name:
-                  try:
-                      attached = iam.list_attached_role_policies(RoleName=ec2_role_name)
-                      for policy in attached.get('AttachedPolicies', []):
-                          logger.info(f'Detaching policy {policy["PolicyArn"]} from {ec2_role_name}')
-                          iam.detach_role_policy(RoleName=ec2_role_name, PolicyArn=policy['PolicyArn'])
-                  except Exception as e:
-                      logger.warning(f'Non-fatal: failed to detach policies from {ec2_role_name}: {e}')
-          
-          
-          def delete_TMT_ec2s(p, stack_name):
-              instances = ec2.describe_instances(
-                  Filters=[
-                      {'Name': f'tag:{p}:cloudformation:stack-name', 'Values': [stack_name]},
-                      {'Name': 'instance-state-name', 'Values': ['running', 'stopped']}
-                  ]
-              )
-              ids = [i['InstanceId'] for r in instances['Reservations'] for i in r['Instances']]
-              if ids:
-                  logger.info(f'Terminating: {ids}')
-                  ec2.terminate_instances(InstanceIds=ids)
-          
-          
-          def delete_mirror_targets(p, stack_name):
-              targets = ec2.describe_traffic_mirror_targets(
-                  Filters=[{'Name': f'tag:{p}:cloudformation:stack-name', 'Values': [stack_name]}]
-              )
-              for t in targets['TrafficMirrorTargets']:
-                  logger.info(f'Deleting Mirror Target: {t["TrafficMirrorTargetId"]}')
-                  ec2.delete_traffic_mirror_target(TrafficMirrorTargetId=t['TrafficMirrorTargetId'])
-          
-          
-          def delete_mirror_sessions(p, stack_name):
-              sessions = ec2.describe_traffic_mirror_sessions(
-                  Filters=[{'Name': f'tag:{p}:cloudformation:stack-name', 'Values': [stack_name]}]
-              )
-              for s in sessions['TrafficMirrorSessions']:
-                  logger.info(f'Deleting Mirror Session: {s["TrafficMirrorSessionId"]}')
-                  ec2.delete_traffic_mirror_session(TrafficMirrorSessionId=s['TrafficMirrorSessionId'])
 
   TrafficMirrorResource:
     Type: Custom::TMTEc2
@@ -733,8 +653,11 @@ Resources:
   # ============================================================
   MirrorSessionCreator:
     Type: AWS::Lambda::Function
+    DependsOn: MirrorSessionCreatorLogGroup
     Properties:
-      FunctionName: !Sub "${ParseELB.TagPrefix}-${ParseELB.SanitizedStackName}-mirror-session-creator"
+      FunctionName: !Sub
+        - "tm-session-creator-${StackUUID}"
+        - StackUUID: !Select [2, !Split ["/", !Ref "AWS::StackId"]]
       Runtime: python3.12
       Handler: index.handler
       Timeout: 600
@@ -861,8 +784,11 @@ Resources:
 
   InitialLambda:
     Type: AWS::Lambda::Function
+    DependsOn: InitialLambdaLogGroup
     Properties:
-      FunctionName: !Sub "${ParseELB.TagPrefix}-${ParseELB.SanitizedStackName}-initial"
+      FunctionName: !Sub
+        - "tm-initial-${StackUUID}"
+        - StackUUID: !Select [2, !Split ["/", !Ref "AWS::StackId"]]
       Runtime: python3.12
       Handler: index.handler
       Timeout: 60
@@ -975,6 +901,41 @@ Resources:
       - TrafficMirrorResource
     Properties:
       ServiceToken: !GetAtt InitialLambda.Arn
+
+  # ============================================================
+  # CloudWatch Log Groups (7-day retention)
+  # ============================================================
+  ParseELBLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub
+        - "/aws/lambda/tm-parse-elb-${StackUUID}"
+        - StackUUID: !Select [2, !Split ["/", !Ref "AWS::StackId"]]
+      RetentionInDays: 7
+
+  TrafficMirrorControllerLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub
+        - "/aws/lambda/tm-controller-${StackUUID}"
+        - StackUUID: !Select [2, !Split ["/", !Ref "AWS::StackId"]]
+      RetentionInDays: 7
+
+  MirrorSessionCreatorLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub
+        - "/aws/lambda/tm-session-creator-${StackUUID}"
+        - StackUUID: !Select [2, !Split ["/", !Ref "AWS::StackId"]]
+      RetentionInDays: 7
+
+  InitialLambdaLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub
+        - "/aws/lambda/tm-initial-${StackUUID}"
+        - StackUUID: !Select [2, !Split ["/", !Ref "AWS::StackId"]]
+      RetentionInDays: 7
 
 Outputs:
   S3Bucket:
