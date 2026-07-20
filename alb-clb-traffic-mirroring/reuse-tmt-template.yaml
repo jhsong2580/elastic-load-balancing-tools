@@ -569,9 +569,11 @@ Resources:
                   p = os.environ['TAG_PREFIX']
                   instance_ids = []
                   target_ids = []
+                  ami_info = ec2.describe_images(ImageIds=[os.environ['AMI_ID']])
+                  root_device = ami_info['Images'][0]['RootDeviceName']
                   for az, subnet_id in subnet_map.items():
                       tags = [{'Key': 'Name', 'Value': f'TMT-{az}'}, {'Key': f'{p}:cloudformation:stack-name', 'Value': os.environ['STACK_NAME']}, {'Key': f'{p}:AZ', 'Value': az}, {'Key': 'tms-create-stack:managed', 'Value': 'true'}, {'Key': 'tms-create-stack:stackname', 'Value': os.environ['STACK_NAME']}]
-                      run_params = dict(ImageId=os.environ['AMI_ID'], InstanceType=os.environ['INSTANCE_TYPE'], MinCount=1, MaxCount=1, NetworkInterfaces=[{'DeviceIndex': 0, 'SubnetId': subnet_id, 'Groups': [os.environ['SECURITY_GROUP_ID']], 'AssociatePublicIpAddress': False}], IamInstanceProfile={'Arn': os.environ['INSTANCE_PROFILE_ARN']}, UserData=get_userdata(os.environ.get('ALB_NAME', 'alb'), az), TagSpecifications=[{'ResourceType': 'instance', 'Tags': tags}], MetadataOptions={'HttpTokens': 'required', 'HttpPutResponseHopLimit': 1, 'HttpEndpoint': 'enabled'})
+                      run_params = dict(ImageId=os.environ['AMI_ID'], InstanceType=os.environ['INSTANCE_TYPE'], MinCount=1, MaxCount=1, NetworkInterfaces=[{'DeviceIndex': 0, 'SubnetId': subnet_id, 'Groups': [os.environ['SECURITY_GROUP_ID']], 'AssociatePublicIpAddress': False}], IamInstanceProfile={'Arn': os.environ['INSTANCE_PROFILE_ARN']}, UserData=get_userdata(os.environ.get('ALB_NAME', 'alb'), az), TagSpecifications=[{'ResourceType': 'instance', 'Tags': tags}], MetadataOptions={'HttpTokens': 'required', 'HttpPutResponseHopLimit': 1, 'HttpEndpoint': 'enabled'}, BlockDeviceMappings=[{'DeviceName': root_device, 'Ebs': {'Encrypted': True, 'VolumeType': 'gp3'}}])
                       if os.environ.get('KEY_PAIR_NAME'): run_params['KeyName'] = os.environ['KEY_PAIR_NAME']
                       instance = ec2.run_instances(**run_params)
                       iid = instance['Instances'][0]['InstanceId']
@@ -638,6 +640,7 @@ Resources:
                 Effect: Allow
                 Action:
                   - ec2:CreateTags
+                  - ec2:DescribeImages
                   - ec2:DescribeInstances
                   - ec2:DescribeNetworkInterfaces
                   - ec2:CreateTrafficMirrorTarget
