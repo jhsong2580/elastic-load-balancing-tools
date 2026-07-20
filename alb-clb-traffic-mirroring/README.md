@@ -8,7 +8,7 @@ When deployed, it:
 - Creates dedicated EC2 instances (one per AZ) to receive mirrored traffic
 - Automatically detects ALB/CLB ENI changes (scale-out/scale-in) via EventBridge
 - Captures all mirrored packets using tcpdump and uploads pcap files to S3
-- Cleans up all resources when the stack is deleted
+- Cleans up all resources when the stack is deleted (except the S3 bucket, which is retained to preserve pcap data — delete manually when no longer needed)
 
 This eliminates the need for the manual 9-step Traffic Mirroring setup process and handles ALB node replacement automatically.
 
