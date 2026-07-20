@@ -260,7 +260,9 @@ Resources:
     Condition: CreateBucket
     DeletionPolicy: Retain
     Properties:
-      BucketName: !Sub "${ParseELB.TagPrefix}-${ParseELB.SanitizedStackName}-pcap"
+      BucketName: !Sub
+        - "tm-pcap-${StackUUID}"
+        - StackUUID: !Select [2, !Split ["/", !Ref "AWS::StackId"]]
       BucketEncryption:
         ServerSideEncryptionConfiguration:
           - ServerSideEncryptionByDefault:
@@ -270,6 +272,24 @@ Resources:
         BlockPublicPolicy: true
         IgnorePublicAcls: true
         RestrictPublicBuckets: true
+
+  PcapBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Condition: CreateBucket
+    Properties:
+      Bucket: !Ref PcapBucket
+      PolicyDocument:
+        Statement:
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: "*"
+            Action: "s3:*"
+            Resource:
+              - !Sub "arn:aws:s3:::${PcapBucket}"
+              - !Sub "arn:aws:s3:::${PcapBucket}/*"
+            Condition:
+              Bool:
+                "aws:SecureTransport": "false"
 
   # ============================================================
   # IAM Role for EC2
@@ -298,11 +318,11 @@ Resources:
                 Resource:
                   - !If
                     - CreateBucket
-                    - !Sub "arn:aws:s3:::${ParseELB.TagPrefix}-${ParseELB.SanitizedStackName}-pcap"
+                    - !Sub "arn:aws:s3:::${PcapBucket}"
                     - !Ref ExistingBucketArn
                   - !If
                     - CreateBucket
-                    - !Sub "arn:aws:s3:::${ParseELB.TagPrefix}-${ParseELB.SanitizedStackName}-pcap/*"
+                    - !Sub "arn:aws:s3:::${PcapBucket}/*"
                     - !Sub "${ExistingBucketArn}/*"
 
   TMTInstanceProfile:
@@ -392,7 +412,7 @@ Resources:
           VNI: 12345
           S3_BUCKET: !If
             - CreateBucket
-            - !Sub "${ParseELB.TagPrefix}-${ParseELB.SanitizedStackName}-pcap"
+            - !Ref PcapBucket
             - !Select [5, !Split [":", !Ref ExistingBucketArn]]
           SUBNET_MAP: !GetAtt ParseELB.SubnetMapping
           ALB_NAME: !GetAtt ParseELB.ELBName
