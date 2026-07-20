@@ -91,7 +91,7 @@ s3://{bucket}/{YYYY}/{MM}/{DD}/{HH}/{elb_name}_{az}_capture_{timestamp}.pcap
 
 ### When are pcap files uploaded to S3?
 
-A background uploader service runs every 30 seconds and uploads completed pcap files to S3. A pcap file is considered "complete" when:
+A background uploader service runs every 5 seconds and uploads completed pcap files to S3. A pcap file is considered "complete" when:
 - **Time rotation (-G)**: The rotation interval has elapsed (default: 1800 seconds / 30 min), and tcpdump closes the current file and starts a new one.
 - **Size rotation (-C)**: The file reaches the max size limit (default: 500 MB), and tcpdump closes it and starts a new one.
 - **Stack deletion**: EC2 ExecStop handler uploads any remaining in-progress pcap files before shutdown.
