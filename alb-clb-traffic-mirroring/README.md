@@ -2,13 +2,13 @@
 
 ## What is this?
 
-A CloudFormation-based automation tool that sets up VPC Traffic Mirroring for ALB/CLB and continuously captures packet data to S3 — without manual intervention.
+A CloudFormation-based automation tool that sets up VPC Traffic Mirroring for ALB/CLB and continuously captures packet data to S3 — without manual intervention. This tool supports AWS commercial partitions only (not aws-cn or aws-us-gov).
 
 When deployed, it:
 - Creates dedicated EC2 instances (one per AZ) to receive mirrored traffic
 - Automatically detects ALB/CLB ENI changes (scale-out/scale-in) via EventBridge
 - Captures all mirrored packets using tcpdump and uploads pcap files to S3
-- Cleans up all resources when the stack is deleted
+- Cleans up all resources when the stack is deleted (except the S3 bucket, which is retained to preserve pcap data — delete manually when no longer needed)
 
 This eliminates the need for the manual 9-step Traffic Mirroring setup process and handles ALB node replacement automatically.
 
@@ -16,7 +16,7 @@ This eliminates the need for the manual 9-step Traffic Mirroring setup process a
 
 ### Stack Creation
 1. **ParseELB** Lambda fetches ALB/CLB info, validates subnets, builds AZ-to-subnet mapping
-2. CloudFormation creates infrastructure: S3 bucket, IAM roles, Security Group (UDP 4789), Traffic Mirror Filter
+2. CloudFormation creates infrastructure: S3 bucket, IAM roles, Security Group (UDP 4789 for VXLAN + TCP 22 for SSH, both from VPC CIDR), Traffic Mirror Filter
 3. **Traffic Mirror Controller** Lambda creates one EC2 per AZ with UserData (vxlan1 + tcpdump + S3 polling uploader) and one Mirror Target per EC2
 4. **Initial Lambda** queries existing ALB/CLB ENIs and invokes Mirror Session Creator for each
 5. **Mirror Session Creator** creates a Traffic Mirror Session per ENI, reusing existing AZ targets
@@ -64,10 +64,10 @@ This eliminates the need for the manual 9-step Traffic Mirroring setup process a
 |------------------------------------|---------------------------------------------|-----------------------------------------|
 | ELBName                            | Name of ALB or CLB to mirror                | `load-balancer-lab`                     |
 | ELBType                            | Type of load balancer                       | `ALB` or `CLB`                          |
-| TrafficMirroringTargetSubnets      | Subnets for mirror target EC2s (one per AZ) | Select from dropdown                    |
+| TrafficMirroringTargetSubnets      | Subnets for mirror target EC2s (same VPC as ALB/CLB). If fewer subnets than ALB/CLB AZs are selected, traffic from uncovered AZs is automatically routed cross-AZ. This works correctly but incurs cross-AZ data transfer charges. For cost optimization, select one subnet per ALB/CLB AZ. | Select from dropdown                    |
 | TrafficMirroringTargetInstanceType | EC2 instance type for capture               | `c5.xlarge` (default)                   |
 | ExistingBucketArn                  | (Optional) Existing S3 bucket ARN           | `arn:aws:s3:::my-bucket` or leave empty |
-| KeyPairName                        | (Optional) EC2 Key Pair for SSH access      | Select from dropdown or leave empty     |
+| KeyPairName                        | (Optional) EC2 Key Pair for SSH access. Leave empty to launch without a login key. Note: TCP 22 is still open from VPC CIDR regardless. | Select from dropdown or leave empty     |
 | PcapRotateSeconds                  | Pcap file rotation interval in seconds      | `1800` (default, 30 min)                |
 | PcapMaxSizeMB                      | Pcap file max size in MB before rotation    | `500` (default)                         |
 | PcapSnapLen                        | Packet snapshot length in bytes             | `0` (default, full packet)              |
@@ -91,7 +91,7 @@ s3://{bucket}/{YYYY}/{MM}/{DD}/{HH}/{elb_name}_{az}_capture_{timestamp}.pcap
 
 ### When are pcap files uploaded to S3?
 
-A background uploader service runs every 30 seconds and uploads completed pcap files to S3. A pcap file is considered "complete" when:
+A background uploader service runs every 5 seconds and uploads completed pcap files to S3. A pcap file is considered "complete" when:
 - **Time rotation (-G)**: The rotation interval has elapsed (default: 1800 seconds / 30 min), and tcpdump closes the current file and starts a new one.
 - **Size rotation (-C)**: The file reaches the max size limit (default: 500 MB), and tcpdump closes it and starts a new one.
 - **Stack deletion**: EC2 ExecStop handler uploads any remaining in-progress pcap files before shutdown.
@@ -103,3 +103,36 @@ A background uploader service runs every 30 seconds and uploads completed pcap f
 | `-G` | PcapRotateSeconds | Rotate the pcap file every N seconds. Each rotated file is immediately eligible for S3 upload. Lower values = more frequent uploads but more small files. |
 | `-C` | PcapMaxSizeMB | Rotate the pcap file when it reaches N MB. Prevents excessively large files on high-traffic ALBs. |
 | `-s` | PcapSnapLen | Capture only the first N bytes of each packet. Use `0` for full packet capture. Set to e.g. `96` to capture headers only (reduces file size significantly). |
+
+---
+
+## Cost Considerations
+
+This stack provisions always-on infrastructure that incurs charges until the stack is deleted. Delete the stack when your capture campaign is complete.
+
+### EC2 Instances
+One instance runs per selected subnet, 24/7. The default instance type is `c5.xlarge`. You can choose a smaller type (e.g., `t3.small`) for low-throughput scenarios.
+- Pricing: https://aws.amazon.com/ec2/pricing/on-demand/
+
+### VPC Traffic Mirroring
+One mirror session is created per ALB/CLB ENI and billed per hour while active. The session count scales automatically as the ALB/CLB scales out — cost grows with node count without further user action.
+- Pricing: https://aws.amazon.com/vpc/pricing/ (Network Analysis tab)
+
+### S3 Storage & KMS
+Pcap files accumulate continuously in S3 with KMS encryption. The bucket is preserved after stack deletion (`DeletionPolicy: Retain`), so storage costs continue until you manually empty and delete the bucket.
+- Storage & Requests pricing: https://aws.amazon.com/s3/pricing/ (Storage & Requests tab)
+- KMS encryption pricing: https://aws.amazon.com/s3/pricing/ (Security & buckets tab)
+
+**Tip**: If you don't need full application-layer payloads, set `PcapSnapLen` to a smaller value (e.g., `96` for headers only). This significantly reduces pcap file sizes, lowering both S3 storage costs and data transfer costs. Note that by default (`PcapSnapLen=0`), full packets are captured — which may include decrypted HTTP payloads (post TLS termination), session cookies, Authorization headers, and other sensitive data.
+
+### Cross-AZ Data Transfer
+If the mirror source (ALB/CLB ENI) and mirror target (EC2) are in different AZs, standard cross-AZ data transfer charges apply. To minimize this cost, select subnets in the same AZs as the ALB/CLB.
+
+### S3 Data Transfer
+EC2 instances upload pcap files to S3 continuously. The data transfer cost depends on the route to S3:
+- **S3 Gateway Endpoint**: No data transfer charge (recommended)
+- **S3 Interface Endpoint**: Per-hour endpoint charge + data processing charge
+- **NAT Gateway**: Per-hour charge + data processing charge ($0.045/GB)
+- **Internet Gateway**: Standard data transfer out charges
+
+Using an S3 Gateway Endpoint is recommended as it incurs no data transfer cost.
