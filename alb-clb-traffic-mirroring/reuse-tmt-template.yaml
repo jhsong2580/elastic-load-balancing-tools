@@ -81,7 +81,7 @@ Parameters:
   KeyPairName:
     Type: String
     Default: ""
-    Description: "EC2 Key Pair name for SSH access to TMT instances. Leave empty for no SSH access."
+    Description: "EC2 Key Pair name for SSH access to TMT instances. Leave empty to launch without a login key. Note: TCP 22 is open from VPC CIDR regardless."
   PcapRotateSeconds:
     Type: Number
     Default: 1800

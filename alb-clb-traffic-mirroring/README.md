@@ -16,7 +16,7 @@ This eliminates the need for the manual 9-step Traffic Mirroring setup process a
 
 ### Stack Creation
 1. **ParseELB** Lambda fetches ALB/CLB info, validates subnets, builds AZ-to-subnet mapping
-2. CloudFormation creates infrastructure: S3 bucket, IAM roles, Security Group (UDP 4789), Traffic Mirror Filter
+2. CloudFormation creates infrastructure: S3 bucket, IAM roles, Security Group (UDP 4789 for VXLAN + TCP 22 for SSH, both from VPC CIDR), Traffic Mirror Filter
 3. **Traffic Mirror Controller** Lambda creates one EC2 per AZ with UserData (vxlan1 + tcpdump + S3 polling uploader) and one Mirror Target per EC2
 4. **Initial Lambda** queries existing ALB/CLB ENIs and invokes Mirror Session Creator for each
 5. **Mirror Session Creator** creates a Traffic Mirror Session per ENI, reusing existing AZ targets
@@ -67,7 +67,7 @@ This eliminates the need for the manual 9-step Traffic Mirroring setup process a
 | TrafficMirroringTargetSubnets      | Subnets for mirror target EC2s (one per AZ) | Select from dropdown                    |
 | TrafficMirroringTargetInstanceType | EC2 instance type for capture               | `c5.xlarge` (default)                   |
 | ExistingBucketArn                  | (Optional) Existing S3 bucket ARN           | `arn:aws:s3:::my-bucket` or leave empty |
-| KeyPairName                        | (Optional) EC2 Key Pair for SSH access      | Select from dropdown or leave empty     |
+| KeyPairName                        | (Optional) EC2 Key Pair for SSH access. Leave empty to launch without a login key. Note: TCP 22 is still open from VPC CIDR regardless. | Select from dropdown or leave empty     |
 | PcapRotateSeconds                  | Pcap file rotation interval in seconds      | `1800` (default, 30 min)                |
 | PcapMaxSizeMB                      | Pcap file max size in MB before rotation    | `500` (default)                         |
 | PcapSnapLen                        | Packet snapshot length in bytes             | `0` (default, full packet)              |
