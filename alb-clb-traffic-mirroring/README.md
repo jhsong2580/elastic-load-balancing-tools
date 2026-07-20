@@ -2,7 +2,7 @@
 
 ## What is this?
 
-A CloudFormation-based automation tool that sets up VPC Traffic Mirroring for ALB/CLB and continuously captures packet data to S3 — without manual intervention.
+A CloudFormation-based automation tool that sets up VPC Traffic Mirroring for ALB/CLB and continuously captures packet data to S3 — without manual intervention. This tool supports AWS commercial partitions only (not aws-cn or aws-us-gov).
 
 When deployed, it:
 - Creates dedicated EC2 instances (one per AZ) to receive mirrored traffic
