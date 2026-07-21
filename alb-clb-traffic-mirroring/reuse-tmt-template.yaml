@@ -536,63 +536,24 @@ Resources:
           def handler(event, context):
               logger.info(f'Event: {json.dumps(event)}')
               if event['RequestType'] == 'Delete':
-                  p = os.environ['TAG_PREFIX']
-                  stack_name = os.environ['STACK_NAME']
-                  # Delete Mirror Sessions
-                  sessions = ec2.describe_traffic_mirror_sessions(Filters=[{'Name': f'tag:{p}:cloudformation:stack-name', 'Values': [stack_name]}])
-                  for s in sessions['TrafficMirrorSessions']:
-                      logger.info(f'Deleting Mirror Session: {s["TrafficMirrorSessionId"]}')
-                      ec2.delete_traffic_mirror_session(TrafficMirrorSessionId=s['TrafficMirrorSessionId'])
-                  # Delete Mirror Targets
-                  targets = ec2.describe_traffic_mirror_targets(Filters=[{'Name': f'tag:{p}:cloudformation:stack-name', 'Values': [stack_name]}])
-                  for t in targets['TrafficMirrorTargets']:
-                      logger.info(f'Deleting Mirror Target: {t["TrafficMirrorTargetId"]}')
-                      ec2.delete_traffic_mirror_target(TrafficMirrorTargetId=t['TrafficMirrorTargetId'])
-                  # Terminate EC2s
-                  instances = ec2.describe_instances(Filters=[{'Name': f'tag:{p}:cloudformation:stack-name', 'Values': [stack_name]}, {'Name': 'instance-state-name', 'Values': ['running', 'stopped']}])
-                  ids = [i['InstanceId'] for r in instances['Reservations'] for i in r['Instances']]
-                  if ids:
-                      logger.info(f'Terminating: {ids}')
-                      ec2.terminate_instances(InstanceIds=ids)
-                  # Detach externally-attached policies from EC2 Role (e.g. SSM Patch Manager)
-                  iam = boto3.client('iam')
-                  ec2_role_name = os.environ.get('EC2_ROLE_NAME', '')
-                  if ec2_role_name:
-                      attached = iam.list_attached_role_policies(RoleName=ec2_role_name)
-                      for policy in attached.get('AttachedPolicies', []):
-                          logger.info(f'Detaching policy {policy["PolicyArn"]} from {ec2_role_name}')
-                          iam.detach_role_policy(RoleName=ec2_role_name, PolicyArn=policy['PolicyArn'])
+                  try:
+                      p = os.environ['TAG_PREFIX']
+                      stack_name = os.environ['STACK_NAME']
+                      delete_mirror_sessions(p, stack_name)
+                      delete_mirror_targets(p, stack_name)
+                      delete_TMT_ec2s(p, stack_name)
+                      ec2_role_name = os.environ.get('EC2_ROLE_NAME', '')
+                      detach_attached_policies_in(ec2_role_name)
+                  except Exception as e:
+                      logger.error(f'Delete cleanup error (non-fatal): {e}')
                   cfn_send(event, context, 'SUCCESS')
                   return
               try:
                   subnet_map = json.loads(os.environ['SUBNET_MAP'])
                   p = os.environ['TAG_PREFIX']
-                  instance_ids = []
-                  target_ids = []
-                  ami_info = ec2.describe_images(ImageIds=[os.environ['AMI_ID']])
-                  root_device = ami_info['Images'][0]['RootDeviceName']
-                  for az, subnet_id in subnet_map.items():
-                      tags = [{'Key': 'Name', 'Value': f'TMT-{az}'}, {'Key': f'{p}:cloudformation:stack-name', 'Value': os.environ['STACK_NAME']}, {'Key': f'{p}:AZ', 'Value': az}, {'Key': 'tms-create-stack:managed', 'Value': 'true'}, {'Key': 'tms-create-stack:stackname', 'Value': os.environ['STACK_NAME']}]
-                      run_params = dict(ImageId=os.environ['AMI_ID'], InstanceType=os.environ['INSTANCE_TYPE'], MinCount=1, MaxCount=1, NetworkInterfaces=[{'DeviceIndex': 0, 'SubnetId': subnet_id, 'Groups': [os.environ['SECURITY_GROUP_ID']], 'AssociatePublicIpAddress': False}], IamInstanceProfile={'Arn': os.environ['INSTANCE_PROFILE_ARN']}, UserData=get_userdata(os.environ.get('ALB_NAME', 'alb'), az), TagSpecifications=[{'ResourceType': 'instance', 'Tags': tags}], MetadataOptions={'HttpTokens': 'required', 'HttpPutResponseHopLimit': 1, 'HttpEndpoint': 'enabled'}, BlockDeviceMappings=[{'DeviceName': root_device, 'Ebs': {'Encrypted': True, 'VolumeType': 'gp3'}}])
-                      if os.environ.get('KEY_PAIR_NAME'): run_params['KeyName'] = os.environ['KEY_PAIR_NAME']
-                      instance = ec2.run_instances(**run_params)
-                      iid = instance['Instances'][0]['InstanceId']
-                      instance_ids.append(iid)
-                      logger.info(f'Created EC2 {iid} in AZ {az}')
-                  # Wait all running
-                  waiter = ec2.get_waiter('instance_running')
-                  waiter.wait(InstanceIds=instance_ids)
-                  # Create Mirror Targets
-                  az_target_map = {}
-                  for iid in instance_ids:
-                      info = ec2.describe_instances(InstanceIds=[iid])
-                      inst = info['Reservations'][0]['Instances'][0]
-                      eni_id = inst['NetworkInterfaces'][0]['NetworkInterfaceId']
-                      az = inst['Placement']['AvailabilityZone']
-                      target = ec2.create_traffic_mirror_target(NetworkInterfaceId=eni_id, Description=f'TMT-{az}', TagSpecifications=[{'ResourceType': 'traffic-mirror-target', 'Tags': [{'Key': 'Name', 'Value': f'TMT-{az}'}, {'Key': f'{p}:cloudformation:stack-name', 'Value': os.environ['STACK_NAME']}, {'Key': f'{p}:AZ', 'Value': az}]}])
-                      tid = target['TrafficMirrorTarget']['TrafficMirrorTargetId']
-                      az_target_map[az] = tid
-                      logger.info(f'Created Mirror Target {tid} for AZ {az}')
+                  instance_ids = create_TMT_ec2s(p, subnet_map)
+                  wait_instances_running(instance_ids)
+                  az_target_map = create_mirror_targets(instance_ids, p)
                   cfn_send(event, context, 'SUCCESS', {'AZTargetMap': json.dumps(az_target_map)})
               except Exception as e:
                   logger.error(f'Error: {str(e)}')
