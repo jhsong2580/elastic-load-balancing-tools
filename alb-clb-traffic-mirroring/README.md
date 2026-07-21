@@ -136,3 +136,7 @@ EC2 instances upload pcap files to S3 continuously. The data transfer cost depen
 - **Internet Gateway**: Standard data transfer out charges
 
 Using an S3 Gateway Endpoint is recommended as it incurs no data transfer cost.
+
+### CloudWatch Logs
+The stack creates 4 CloudWatch Log Groups (one per Lambda function) where Lambda execution logs are stored. A 7-day retention policy is applied to each log group to limit storage costs. Log storage is billed at standard CloudWatch Logs pricing.
+- Pricing: https://aws.amazon.com/cloudwatch/pricing/ (Logs tab)
