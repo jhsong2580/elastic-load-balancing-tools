@@ -340,22 +340,11 @@ Resources:
     Properties:
       GroupDescription: Traffic Mirror Target EC2 - VXLAN ingress
       VpcId: !GetAtt ParseELB.VpcId
-      SecurityGroupIngress:
-        - IpProtocol: udp
-          FromPort: 4789
-          ToPort: 4789
-          CidrIp: !GetAtt ParseELB.VpcCidr
-        - IpProtocol: tcp
-          FromPort: 22
-          ToPort: 22
-          CidrIp: !GetAtt ParseELB.VpcCidr
       SecurityGroupEgress:
         - IpProtocol: tcp
           FromPort: 443
           ToPort: 443
           DestinationPrefixListId: !GetAtt ParseELB.S3PrefixListId
-        - IpProtocol: "-1"
-          CidrIp: !GetAtt ParseELB.VpcCidr
       Tags:
         - Key: Name
           Value: !Sub "${ParseELB.TagPrefix}-${ParseELB.SanitizedStackName}-sg"
@@ -420,6 +409,7 @@ Resources:
           STACK_NAME: !Ref AWS::StackName
           KEY_PAIR_NAME: !Ref KeyPairName
           EC2_ROLE_NAME: !Ref TMTRole
+          VPC_ID: !GetAtt ParseELB.VpcId
           PCAP_ROTATE_SECONDS: !Ref PcapRotateSeconds
           PCAP_MAX_SIZE_MB: !Ref PcapMaxSizeMB
           PCAP_SNAP_LEN: !Ref PcapSnapLen
@@ -564,6 +554,9 @@ Resources:
                   subnet_map = json.loads(os.environ['SUBNET_MAP'])
                   p = os.environ['TAG_PREFIX']
           
+                  # Add SG ingress/egress rules for all VPC CIDRs (supports secondary CIDRs)
+                  configure_security_group_rules()
+          
                   instance_ids = create_TMT_ec2s(p, subnet_map)
           
                   # Wait all running
@@ -652,6 +645,31 @@ Resources:
                       logger.warning(f'Non-fatal: failed to detach policies from {ec2_role_name}: {e}')
           
           
+          def configure_security_group_rules():
+              sg_id = os.environ['SECURITY_GROUP_ID']
+              vpc_info = ec2.describe_vpcs(VpcIds=[os.environ['VPC_ID']])
+              for assoc in vpc_info['Vpcs'][0]['CidrBlockAssociationSet']:
+                  if assoc['CidrBlockState']['State'] == 'associated':
+                      cidr = assoc['CidrBlock']
+                      try:
+                          ec2.authorize_security_group_ingress(GroupId=sg_id, IpPermissions=[
+                              {'IpProtocol': 'udp', 'FromPort': 4789, 'ToPort': 4789, 'IpRanges': [{'CidrIp': cidr}]},
+                              {'IpProtocol': 'tcp', 'FromPort': 22, 'ToPort': 22, 'IpRanges': [{'CidrIp': cidr}]}
+                          ])
+                      except Exception as e:
+                          if 'InvalidPermission.Duplicate' not in str(e):
+                              logger.error(f'Failed to add ingress rules for {cidr}: {e}')
+                              raise
+                      try:
+                          ec2.authorize_security_group_egress(GroupId=sg_id, IpPermissions=[
+                              {'IpProtocol': '-1', 'IpRanges': [{'CidrIp': cidr}]}
+                          ])
+                      except Exception as e:
+                          if 'InvalidPermission.Duplicate' not in str(e):
+                              logger.error(f'Failed to add egress rules for {cidr}: {e}')
+                              raise
+              logger.info(f'SG {sg_id}: ingress/egress rules configured for all VPC CIDRs')
+          
           def delete_TMT_ec2s(p, stack_name):
               instances = ec2.describe_instances(
                   Filters=[
@@ -727,6 +745,7 @@ Resources:
                   - ec2:DescribeImages
                   - ec2:DescribeInstances
                   - ec2:DescribeNetworkInterfaces
+                  - ec2:DescribeVpcs
                   - ec2:CreateTrafficMirrorTarget
                   - ec2:DeleteTrafficMirrorTarget
                   - ec2:CreateTrafficMirrorSession
@@ -734,6 +753,12 @@ Resources:
                   - ec2:DescribeTrafficMirrorSessions
                   - ec2:DescribeTrafficMirrorTargets
                 Resource: "*"
+              - Sid: SecurityGroupRules
+                Effect: Allow
+                Action:
+                  - ec2:AuthorizeSecurityGroupIngress
+                  - ec2:AuthorizeSecurityGroupEgress
+                Resource: !Sub "arn:aws:ec2:${AWS::Region}:${AWS::AccountId}:security-group/${TMTSecurityGroup}"
               - Sid: EC2Terminate
                 Effect: Allow
                 Action:
