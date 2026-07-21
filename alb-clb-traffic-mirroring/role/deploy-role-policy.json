@@ -38,7 +38,28 @@
         "lambda:InvokeFunction",
         "lambda:GetPolicy"
       ],
-      "Resource": "*"
+      "Resource": [
+        "arn:aws:lambda:*:*:function:tm-parse-elb-*",
+        "arn:aws:lambda:*:*:function:tm-controller-*",
+        "arn:aws:lambda:*:*:function:tm-session-creator-*",
+        "arn:aws:lambda:*:*:function:tm-initial-*"
+      ]
+    },
+    {
+      "Sid": "CloudWatchLogs",
+      "Effect": "Allow",
+      "Action": [
+        "logs:CreateLogGroup",
+        "logs:DeleteLogGroup",
+        "logs:PutRetentionPolicy",
+        "logs:DescribeLogGroups"
+      ],
+      "Resource": [
+        "arn:aws:logs:*:*:log-group:/aws/lambda/tm-parse-elb-*",
+        "arn:aws:logs:*:*:log-group:/aws/lambda/tm-controller-*",
+        "arn:aws:logs:*:*:log-group:/aws/lambda/tm-session-creator-*",
+        "arn:aws:logs:*:*:log-group:/aws/lambda/tm-initial-*"
+      ]
     },
     {
       "Sid": "EC2",
@@ -71,9 +92,11 @@
         "s3:CreateBucket",
         "s3:DeleteBucket",
         "s3:PutEncryptionConfiguration",
-        "s3:PutBucketPublicAccessBlock"
+        "s3:PutBucketPublicAccessBlock",
+        "s3:PutBucketPolicy",
+        "s3:DeleteBucketPolicy"
       ],
-      "Resource": "*"
+      "Resource": "arn:aws:s3:::tm-pcap-*"
     },
     {
       "Sid": "EventBridge",

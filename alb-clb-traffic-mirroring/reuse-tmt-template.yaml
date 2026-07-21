@@ -132,10 +132,11 @@ Resources:
 
   ParseELBFunction:
     Type: AWS::Lambda::Function
+    DependsOn: ParseELBLogGroup
     Properties:
       FunctionName: !Sub
-        - "tms-create-stack-${StackUUID}-parse-elb"
-        - StackUUID: !Select [0, !Split ["-", !Select [2, !Split ["/", !Ref "AWS::StackId"]]]]
+        - "tm-parse-elb-${StackUUID}"
+        - StackUUID: !Select [2, !Split ["/", !Ref "AWS::StackId"]]
       Runtime: python3.12
       Handler: index.handler
       Role: !GetAtt ParseELBRole.Arn
@@ -259,7 +260,9 @@ Resources:
     Condition: CreateBucket
     DeletionPolicy: Retain
     Properties:
-      BucketName: !Sub "${ParseELB.TagPrefix}-${ParseELB.SanitizedStackName}-pcap"
+      BucketName: !Sub
+        - "tm-pcap-${StackUUID}"
+        - StackUUID: !Select [2, !Split ["/", !Ref "AWS::StackId"]]
       BucketEncryption:
         ServerSideEncryptionConfiguration:
           - ServerSideEncryptionByDefault:
@@ -269,6 +272,24 @@ Resources:
         BlockPublicPolicy: true
         IgnorePublicAcls: true
         RestrictPublicBuckets: true
+
+  PcapBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Condition: CreateBucket
+    Properties:
+      Bucket: !Ref PcapBucket
+      PolicyDocument:
+        Statement:
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: "*"
+            Action: "s3:*"
+            Resource:
+              - !Sub "arn:aws:s3:::${PcapBucket}"
+              - !Sub "arn:aws:s3:::${PcapBucket}/*"
+            Condition:
+              Bool:
+                "aws:SecureTransport": "false"
 
   # ============================================================
   # IAM Role for EC2
@@ -297,11 +318,11 @@ Resources:
                 Resource:
                   - !If
                     - CreateBucket
-                    - !Sub "arn:aws:s3:::${ParseELB.TagPrefix}-${ParseELB.SanitizedStackName}-pcap"
+                    - !Sub "arn:aws:s3:::${PcapBucket}"
                     - !Ref ExistingBucketArn
                   - !If
                     - CreateBucket
-                    - !Sub "arn:aws:s3:::${ParseELB.TagPrefix}-${ParseELB.SanitizedStackName}-pcap/*"
+                    - !Sub "arn:aws:s3:::${PcapBucket}/*"
                     - !Sub "${ExistingBucketArn}/*"
 
   TMTInstanceProfile:
@@ -373,8 +394,11 @@ Resources:
   # ============================================================
   TrafficMirrorController:
     Type: AWS::Lambda::Function
+    DependsOn: TrafficMirrorControllerLogGroup
     Properties:
-      FunctionName: !Sub "${ParseELB.TagPrefix}-${ParseELB.SanitizedStackName}-controller"
+      FunctionName: !Sub
+        - "tm-controller-${StackUUID}"
+        - StackUUID: !Select [2, !Split ["/", !Ref "AWS::StackId"]]
       Runtime: python3.12
       Handler: index.handler
       Role: !GetAtt MirrorSessionCreatorRole.Arn
@@ -388,7 +412,7 @@ Resources:
           VNI: 12345
           S3_BUCKET: !If
             - CreateBucket
-            - !Sub "${ParseELB.TagPrefix}-${ParseELB.SanitizedStackName}-pcap"
+            - !Ref PcapBucket
             - !Select [5, !Split [":", !Ref ExistingBucketArn]]
           SUBNET_MAP: !GetAtt ParseELB.SubnetMapping
           ALB_NAME: !GetAtt ParseELB.ELBName
@@ -582,6 +606,8 @@ Resources:
           
           
           def create_TMT_ec2s(p, subnet_map) -> list:
+              ami_info = ec2.describe_images(ImageIds=[os.environ['AMI_ID']])
+              root_device = ami_info['Images'][0]['RootDeviceName']
               instance_ids = []
               for az, subnet_id in subnet_map.items():
                   tags = [
@@ -604,7 +630,7 @@ Resources:
                       IamInstanceProfile={'Arn': os.environ['INSTANCE_PROFILE_ARN']},
                       UserData=get_userdata(os.environ.get('ALB_NAME', 'alb'), az),
                       TagSpecifications=[{'ResourceType': 'instance', 'Tags': tags}],
-                      MetadataOptions={'HttpTokens': 'required', 'HttpPutResponseHopLimit': 1, 'HttpEndpoint': 'enabled'}
+                      MetadataOptions={'HttpTokens': 'required', 'HttpPutResponseHopLimit': 1, 'HttpEndpoint': 'enabled'}, BlockDeviceMappings=[{'DeviceName': root_device, 'Ebs': {'Encrypted': True, 'VolumeType': 'gp3'}}]
                   )
                   if os.environ.get('KEY_PAIR_NAME'):
                       run_params['KeyName'] = os.environ['KEY_PAIR_NAME']
@@ -698,6 +724,7 @@ Resources:
                 Effect: Allow
                 Action:
                   - ec2:CreateTags
+                  - ec2:DescribeImages
                   - ec2:DescribeInstances
                   - ec2:DescribeNetworkInterfaces
                   - ec2:CreateTrafficMirrorTarget
@@ -733,8 +760,11 @@ Resources:
   # ============================================================
   MirrorSessionCreator:
     Type: AWS::Lambda::Function
+    DependsOn: MirrorSessionCreatorLogGroup
     Properties:
-      FunctionName: !Sub "${ParseELB.TagPrefix}-${ParseELB.SanitizedStackName}-mirror-session-creator"
+      FunctionName: !Sub
+        - "tm-session-creator-${StackUUID}"
+        - StackUUID: !Select [2, !Split ["/", !Ref "AWS::StackId"]]
       Runtime: python3.12
       Handler: index.handler
       Timeout: 600
@@ -861,8 +891,11 @@ Resources:
 
   InitialLambda:
     Type: AWS::Lambda::Function
+    DependsOn: InitialLambdaLogGroup
     Properties:
-      FunctionName: !Sub "${ParseELB.TagPrefix}-${ParseELB.SanitizedStackName}-initial"
+      FunctionName: !Sub
+        - "tm-initial-${StackUUID}"
+        - StackUUID: !Select [2, !Split ["/", !Ref "AWS::StackId"]]
       Runtime: python3.12
       Handler: index.handler
       Timeout: 60
@@ -975,6 +1008,41 @@ Resources:
       - TrafficMirrorResource
     Properties:
       ServiceToken: !GetAtt InitialLambda.Arn
+
+  # ============================================================
+  # CloudWatch Log Groups (7-day retention)
+  # ============================================================
+  ParseELBLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub
+        - "/aws/lambda/tm-parse-elb-${StackUUID}"
+        - StackUUID: !Select [2, !Split ["/", !Ref "AWS::StackId"]]
+      RetentionInDays: 7
+
+  TrafficMirrorControllerLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub
+        - "/aws/lambda/tm-controller-${StackUUID}"
+        - StackUUID: !Select [2, !Split ["/", !Ref "AWS::StackId"]]
+      RetentionInDays: 7
+
+  MirrorSessionCreatorLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub
+        - "/aws/lambda/tm-session-creator-${StackUUID}"
+        - StackUUID: !Select [2, !Split ["/", !Ref "AWS::StackId"]]
+      RetentionInDays: 7
+
+  InitialLambdaLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub
+        - "/aws/lambda/tm-initial-${StackUUID}"
+        - StackUUID: !Select [2, !Split ["/", !Ref "AWS::StackId"]]
+      RetentionInDays: 7
 
 Outputs:
   S3Bucket:
