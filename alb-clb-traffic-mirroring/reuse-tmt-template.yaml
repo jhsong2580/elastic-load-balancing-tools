@@ -648,26 +648,24 @@ Resources:
           def configure_security_group_rules():
               sg_id = os.environ['SECURITY_GROUP_ID']
               vpc_info = ec2.describe_vpcs(VpcIds=[os.environ['VPC_ID']])
-              for assoc in vpc_info['Vpcs'][0]['CidrBlockAssociationSet']:
-                  if assoc['CidrBlockState']['State'] == 'associated':
-                      cidr = assoc['CidrBlock']
-                      try:
-                          ec2.authorize_security_group_ingress(GroupId=sg_id, IpPermissions=[
-                              {'IpProtocol': 'udp', 'FromPort': 4789, 'ToPort': 4789, 'IpRanges': [{'CidrIp': cidr}]},
-                              {'IpProtocol': 'tcp', 'FromPort': 22, 'ToPort': 22, 'IpRanges': [{'CidrIp': cidr}]}
-                          ])
-                      except Exception as e:
-                          if 'InvalidPermission.Duplicate' not in str(e):
-                              logger.error(f'Failed to add ingress rules for {cidr}: {e}')
-                              raise
-                      try:
-                          ec2.authorize_security_group_egress(GroupId=sg_id, IpPermissions=[
-                              {'IpProtocol': '-1', 'IpRanges': [{'CidrIp': cidr}]}
-                          ])
-                      except Exception as e:
-                          if 'InvalidPermission.Duplicate' not in str(e):
-                              logger.error(f'Failed to add egress rules for {cidr}: {e}')
-                              raise
+              ip_ranges = [{'CidrIp': assoc['CidrBlock']} for assoc in vpc_info['Vpcs'][0]['CidrBlockAssociationSet'] if assoc['CidrBlockState']['State'] == 'associated']
+              try:
+                  ec2.authorize_security_group_ingress(GroupId=sg_id, IpPermissions=[
+                      {'IpProtocol': 'udp', 'FromPort': 4789, 'ToPort': 4789, 'IpRanges': ip_ranges},
+                      {'IpProtocol': 'tcp', 'FromPort': 22, 'ToPort': 22, 'IpRanges': ip_ranges}
+                  ])
+              except Exception as e:
+                  if 'InvalidPermission.Duplicate' not in str(e):
+                      logger.error(f'Failed to add ingress rules: {e}')
+                      raise
+              try:
+                  ec2.authorize_security_group_egress(GroupId=sg_id, IpPermissions=[
+                      {'IpProtocol': 'tcp', 'FromPort': 443, 'ToPort': 443, 'IpRanges': ip_ranges}
+                  ])
+              except Exception as e:
+                  if 'InvalidPermission.Duplicate' not in str(e):
+                      logger.error(f'Failed to add egress rules: {e}')
+                      raise
               logger.info(f'SG {sg_id}: ingress/egress rules configured for all VPC CIDRs')
           
           def delete_TMT_ec2s(p, stack_name):
