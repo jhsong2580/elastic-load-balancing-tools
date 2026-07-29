@@ -14,6 +14,7 @@ Metadata:
         Parameters:
           - TrafficMirroringTargetSubnets
           - TrafficMirroringTargetInstanceType
+          - TargetInstancesPerSubnet
           - KeyPairName
       - Label:
           default: "Pcap Capture Settings — Files are rotated and uploaded to S3 when EITHER the time limit (-G) OR size limit (-C) is reached, whichever comes first. Use -s to limit capture to packet headers only and reduce file size."
@@ -34,6 +35,8 @@ Metadata:
         default: "Target Subnets (same VPC as ALB/CLB)"
       TrafficMirroringTargetInstanceType:
         default: "EC2 Instance Type"
+      TargetInstancesPerSubnet:
+        default: "Instances Per Subnet (max mirror sources = this × 12)"
       KeyPairName:
         default: "SSH Key Pair (optional)"
       PcapRotateSeconds:
@@ -72,6 +75,12 @@ Parameters:
       - c5n.large
       - c5n.xlarge
       - c5n.2xlarge
+  TargetInstancesPerSubnet:
+    Type: Number
+    Default: 1
+    MinValue: 1
+    MaxValue: 12
+    Description: "Number of TMT EC2 instances per subnet. Each instance supports up to 10 mirror sources. Default 1 (supports up to 10 ENIs per AZ)."
   ExistingBucketArn:
     Type: String
     Default: ""
@@ -404,6 +413,7 @@ Resources:
             - !Ref PcapBucket
             - !Select [5, !Split [":", !Ref ExistingBucketArn]]
           SUBNET_MAP: !GetAtt ParseELB.SubnetMapping
+          INSTANCES_PER_SUBNET: !Ref TargetInstancesPerSubnet
           ALB_NAME: !GetAtt ParseELB.ELBName
           TAG_PREFIX: !GetAtt ParseELB.TagPrefix
           STACK_NAME: !Ref AWS::StackName
@@ -588,7 +598,9 @@ Resources:
                       ]}]
                   )
                   tid = target['TrafficMirrorTarget']['TrafficMirrorTargetId']
-                  az_target_map[az] = tid
+                  if az not in az_target_map:
+                      az_target_map[az] = []
+                  az_target_map[az].append(tid)
                   logger.info(f'Created Mirror Target {tid} for AZ {az}')
               return az_target_map
           
@@ -601,6 +613,7 @@ Resources:
           def create_TMT_ec2s(p, subnet_map) -> list:
               ami_info = ec2.describe_images(ImageIds=[os.environ['AMI_ID']])
               root_device = ami_info['Images'][0]['RootDeviceName']
+              instances_per_subnet = int(os.environ.get('INSTANCES_PER_SUBNET', '1'))
               instance_ids = []
               for az, subnet_id in subnet_map.items():
                   tags = [
@@ -613,7 +626,7 @@ Resources:
                   run_params = dict(
                       ImageId=os.environ['AMI_ID'],
                       InstanceType=os.environ['INSTANCE_TYPE'],
-                      MinCount=1, MaxCount=1,
+                      MinCount=instances_per_subnet, MaxCount=instances_per_subnet,
                       NetworkInterfaces=[{
                           'DeviceIndex': 0,
                           'SubnetId': subnet_id,
@@ -627,10 +640,10 @@ Resources:
                   )
                   if os.environ.get('KEY_PAIR_NAME'):
                       run_params['KeyName'] = os.environ['KEY_PAIR_NAME']
-                  instance = ec2.run_instances(**run_params)
-                  iid = instance['Instances'][0]['InstanceId']
-                  instance_ids.append(iid)
-                  logger.info(f'Created EC2 {iid} in AZ {az}')
+                  result = ec2.run_instances(**run_params)
+                  iids = [i['InstanceId'] for i in result['Instances']]
+                  instance_ids.extend(iids)
+                  logger.info(f'Created {len(iids)} EC2 instances in AZ {az}: {iids}')
               return instance_ids
           
           
