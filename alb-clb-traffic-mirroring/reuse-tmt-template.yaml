@@ -828,9 +828,8 @@ Resources:
                           except Exception as e:
                               if attempt == max_attempts - 1:
                                   raise
-                              logger.warning(f'{func.__name__} retry {attempt+1}/{max_attempts}: {e}')
-                              time.sleep(interval)
                               wait = interval + random.uniform(0, jitter)
+                              logger.warning(f'{func.__name__} retry {attempt+1}/{max_attempts} (wait {wait:.1f}s): {e}')
                               time.sleep(wait)
                   return wrapper
               return decorator
