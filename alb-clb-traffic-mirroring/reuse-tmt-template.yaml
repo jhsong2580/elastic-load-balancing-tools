@@ -881,10 +881,11 @@ Resources:
 
               # 2. Cross-AZ fallback
               all_targets = [tid for tids in az_target_map.values() for tid in tids]
-              selected, counts = select_least_loaded_target(all_targets)
-              if selected:
-                  logger.info(f'TMTSelector: cross-AZ selected {selected} (sessions: {counts})')
-                  return selected
+              if all_targets:
+                  selected, counts = select_least_loaded_target(all_targets)
+                  if selected:
+                      logger.info(f'TMTSelector: cross-AZ selected {selected} (sessions: {counts})')
+                      return selected
 
               raise Exception(f'All mirror targets are full ({MAX_SESSIONS_PER_TARGET} sessions each). Increase TargetInstancesPerSubnet or add more subnets.')
 
