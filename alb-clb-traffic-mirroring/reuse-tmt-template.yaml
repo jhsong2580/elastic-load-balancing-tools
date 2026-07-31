@@ -487,7 +487,7 @@ Resources:
           Requires=vxlan-setup.service
           Before=pcap-uploader.service
           [Service]
-          ExecStart=/usr/sbin/tcpdump -i vxlan1 -s {snap_len} -w /tms/${{ALB_NAME}}_${{AZ}}_capture_%%Y%%m%%d_%%H%%M%%S.pcap -G {rotate_sec} -C {max_size_mb} -Z root
+          ExecStart=/usr/sbin/tcpdump -i vxlan1 -s {snap_len} -w /tms/${{ALB_NAME}}_${{AZ}}_${{LOCAL_IP}}_capture_%%Y%%m%%d_%%H%%M%%S.pcap -G {rotate_sec} -C {max_size_mb} -Z root
           Restart=always
           RestartSec=3
           [Install]

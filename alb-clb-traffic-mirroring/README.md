@@ -87,7 +87,7 @@ This eliminates the need for the manual 9-step Traffic Mirroring setup process a
 
 Files are stored in S3 with the following path structure:
 ```
-s3://{bucket}/{YYYY}/{MM}/{DD}/{HH}/{elb_name}_{az}_capture_{timestamp}.pcap
+s3://{bucket}/{YYYY}/{MM}/{DD}/{HH}/{elb_name}_{az}_{private_ip}_capture_{timestamp}.pcap
 ```
 
 ### When are pcap files uploaded to S3?
