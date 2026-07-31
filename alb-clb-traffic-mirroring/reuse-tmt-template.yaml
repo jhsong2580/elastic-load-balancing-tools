@@ -36,7 +36,7 @@ Metadata:
       TrafficMirroringTargetInstanceType:
         default: "EC2 Instance Type"
       TargetInstancesPerSubnet:
-        default: "Instances Per Subnet (max mirror sources = this × 12)"
+        default: "Instances Per Subnet (max mirror sources = this × 10)"
       KeyPairName:
         default: "SSH Key Pair (optional)"
       PcapRotateSeconds:
