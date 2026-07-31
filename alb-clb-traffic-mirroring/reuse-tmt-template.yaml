@@ -814,12 +814,12 @@ Resources:
           AZ_TARGET_MAP: !GetAtt TrafficMirrorResource.AZTargetMap
       Code:
         ZipFile: |
-          import boto3, json, os, logging, time
+          import boto3, json, os, logging, time, random
           logger = logging.getLogger()
           logger.setLevel(logging.INFO)
           ec2 = boto3.client('ec2')
 
-          def retry(max_attempts=3, interval=60):
+          def retry(max_attempts=3, interval=30, jitter=30):
               def decorator(func):
                   def wrapper(*args, **kwargs):
                       for attempt in range(max_attempts):
@@ -830,6 +830,8 @@ Resources:
                                   raise
                               logger.warning(f'{func.__name__} retry {attempt+1}/{max_attempts}: {e}')
                               time.sleep(interval)
+                              wait = interval + random.uniform(0, jitter)
+                              time.sleep(wait)
                   return wrapper
               return decorator
 
