@@ -838,7 +838,6 @@ Resources:
               existing = ec2.describe_traffic_mirror_sessions(Filters=[{'Name': 'network-interface-id', 'Values': [eni_id]}])
               return len(existing['TrafficMirrorSessions']) > 0
 
-          @retry(max_attempts=3, interval=60)
           def create_mirror_session(eni_id, target_id, tags):
               logger.info(f'Creating Mirror Session: source={eni_id}, target={target_id}')
               ec2.create_traffic_mirror_session(
@@ -851,30 +850,59 @@ Resources:
               logger.info(f'Mirror Session created for {eni_id}')
 
           def TMTSelector(az, az_target_map):
-              """Select best Mirror Target: same AZ preferred, otherwise least-loaded Target."""
-              # 1. Same AZ match
-              if az in az_target_map:
-                  logger.info(f'TMTSelector: same AZ match for {az}')
-                  return az_target_map[az]
-              # 2. Load balance: pick target with fewest sessions
-              all_target_ids = list(az_target_map.values())
-              sessions = ec2.describe_traffic_mirror_sessions(Filters=[{'Name': 'traffic-mirror-target-id', 'Values': all_target_ids}])
-              target_counts = {tid: 0 for tid in all_target_ids}
-              for s in sessions.get('TrafficMirrorSessions', []):
-                  tid = s['TrafficMirrorTargetId']
-                  if tid in target_counts:
-                      target_counts[tid] += 1
-              selected = min(target_counts, key=target_counts.get)
-              logger.info(f'TMTSelector: no target in {az}, selected {selected} (sessions: {target_counts})')
-              return selected
+              """Select best Mirror Target: same AZ least-loaded preferred, fallback to cross-AZ least-loaded. Max 10 sessions per target."""
+              MAX_SESSIONS_PER_TARGET = 10
+
+              def get_session_counts(target_ids):
+                  session_counts_per_target = {tid: 0 for tid in target_ids}
+                  pages = ec2.get_paginator('describe_traffic_mirror_sessions')
+                  for page in pages.paginate(Filters=[{'Name': 'traffic-mirror-target-id', 'Values': target_ids}]):
+                      for trafficMirrorSession in page.get('TrafficMirrorSessions', []):
+                          tid = trafficMirrorSession['TrafficMirrorTargetId']
+                          if tid in session_counts_per_target:
+                              session_counts_per_target[tid] += 1
+                  return session_counts_per_target
+
+              def select_least_loaded_target(target_ids):
+                  session_counts_per_target = get_session_counts(target_ids)
+                  selected = min(session_counts_per_target, key=session_counts_per_target.get)
+                  if session_counts_per_target[selected] < MAX_SESSIONS_PER_TARGET:
+                      return selected, session_counts_per_target
+                  return None, session_counts_per_target
+
+              # 1. Same AZ
+              same_az_targets = az_target_map.get(az, [])
+              if same_az_targets:
+                  selected, counts = select_least_loaded_target(same_az_targets)
+                  if selected:
+                      logger.info(f'TMTSelector: same AZ {az}, selected {selected} (sessions: {counts})')
+                      return selected
+                  logger.info(f'TMTSelector: all targets in {az} full ({counts}), falling back to cross-AZ')
+
+              # 2. Cross-AZ fallback
+              all_targets = [tid for tids in az_target_map.values() for tid in tids]
+              selected, counts = select_least_loaded_target(all_targets)
+              if selected:
+                  logger.info(f'TMTSelector: cross-AZ selected {selected} (sessions: {counts})')
+                  return selected
+
+              raise Exception(f'All mirror targets are full ({MAX_SESSIONS_PER_TARGET} sessions each). Increase TargetInstancesPerSubnet or add more subnets.')
+
+          @retry(max_attempts=3, interval=60)
+          def select_and_create_session(eni_id, az, az_target_map, tags):
+              target_id = TMTSelector(az, az_target_map)
+              create_mirror_session(eni_id, target_id, tags)
 
           def handler(event, context):
               logger.info(f'Event: {json.dumps(event)}')
               # Parse ENI info
+          
+              # Invoked by EventBridge (CloudTrail CreateNetworkInterface event)
               if 'detail' in event:
                   detail = event['detail']
                   eni_id = detail['responseElements']['networkInterface']['networkInterfaceId']
                   az = detail['responseElements']['networkInterface']['availabilityZone']
+              # Invoked by InitialLambda (fire-and-forget invoke)
               else:
                   eni_id = event['eni_id']
                   az = event['availability_zone']
@@ -883,17 +911,16 @@ Resources:
                   logger.info(f'Mirror session already exists for {eni_id}, skipping')
                   return {'statusCode': 200, 'body': f'Already exists for {eni_id}'}
 
-              # Find target using TMTSelector
+              # Select target and create session (retry covers race condition)
               az_target_map = json.loads(os.environ['AZ_TARGET_MAP'])
-              target_id = TMTSelector(az, az_target_map)
-
               p = os.environ['TAG_PREFIX']
               tags = [
                   {'Key': 'Name', 'Value': f'TMS-{eni_id}'},
                   {'Key': f'{p}:cloudformation:stack-name', 'Value': os.environ['STACK_NAME']},
                   {'Key': f'{p}:SourceENI', 'Value': eni_id}
               ]
-              create_mirror_session(eni_id, target_id, tags)
+
+              select_and_create_session(eni_id, az, az_target_map, tags)
               return {'statusCode': 200, 'body': f'Mirror Session created for {eni_id}'}
 
   # ============================================================
